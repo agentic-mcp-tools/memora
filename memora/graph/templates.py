@@ -801,6 +801,57 @@ function highlightMemoryInGraph(memId) {
     document.querySelectorAll('#timeline-list .memory-item').forEach(function(el) {
         el.classList.toggle('selected', parseInt(el.dataset.id, 10) === memId);
     });
+    // Highlight the memory's section in the left hierarchy pane
+    var mem = (typeof memoriesData !== 'undefined' && memoriesData[memId]) ? memoriesData[memId] :
+              (typeof memoryCache !== 'undefined' && memoryCache[memId]) ? memoryCache[memId] : null;
+    if (mem) {
+        highlightMemorySection(mem);
+    }
+}
+
+function highlightMemorySection(mem) {
+    // Clear previous selection
+    document.querySelectorAll('.subsection-item.selected, .section-item.selected, .legend-item.selected').forEach(function(el) { el.classList.remove('selected'); });
+    if (!mem.metadata) return;
+    // Handle issues
+    if (mem.metadata.type === 'issue' && mem.metadata.status) {
+        var statusKey = mem.metadata.status;
+        if (statusKey === 'closed' && mem.metadata.closed_reason) {
+            statusKey = 'closed:' + mem.metadata.closed_reason;
+        }
+        var issueEl = document.querySelector('.legend-item.issue-status[data-status="' + statusKey + '"]');
+        if (issueEl) issueEl.classList.add('selected');
+    }
+    // Handle TODOs
+    else if (mem.metadata.type === 'todo' && mem.metadata.status) {
+        var statusKey = mem.metadata.status;
+        if (statusKey === 'closed' && mem.metadata.closed_reason) {
+            statusKey = 'closed:' + mem.metadata.closed_reason;
+        }
+        var todoEl = document.querySelector('.legend-item.todo-status[data-todo-status="' + statusKey + '"]');
+        if (todoEl) todoEl.classList.add('selected');
+    }
+    // Handle regular memories with sections
+    else {
+        var section, subsection;
+        var hierarchy = mem.metadata.hierarchy;
+        if (hierarchy && hierarchy.path && hierarchy.path.length >= 1) {
+            section = hierarchy.path[0];
+            subsection = hierarchy.path.slice(1).join('/');
+        } else {
+            section = mem.metadata.section;
+            subsection = mem.metadata.subsection;
+        }
+        if (section) {
+            var sectionEl = document.querySelector('.section-item[data-section="' + section + '"]');
+            if (sectionEl) sectionEl.classList.add('selected');
+            if (subsection) {
+                var path = section + '/' + subsection;
+                var el = document.querySelector('.subsection-item[data-subsection="' + path + '"]');
+                if (el) el.classList.add('selected');
+            }
+        }
+    }
 }
 
 function showMemoryDetails(memId) {
@@ -882,48 +933,7 @@ function showPanel(mem) {
     document.getElementById('resize-handle').classList.add('active');
 
     // Highlight the memory's subsection/status in the left pane
-    document.querySelectorAll('.subsection-item.selected, .section-item.selected, .legend-item.selected').forEach(el => el.classList.remove('selected'));
-    if (mem.metadata) {
-        // Handle issues
-        if (mem.metadata.type === 'issue' && mem.metadata.status) {
-            var statusKey = mem.metadata.status;
-            if (statusKey === 'closed' && mem.metadata.closed_reason) {
-                statusKey = 'closed:' + mem.metadata.closed_reason;
-            }
-            var issueEl = document.querySelector('.legend-item.issue-status[data-status="' + statusKey + '"]');
-            if (issueEl) issueEl.classList.add('selected');
-        }
-        // Handle TODOs
-        else if (mem.metadata.type === 'todo' && mem.metadata.status) {
-            var statusKey = mem.metadata.status;
-            if (statusKey === 'closed' && mem.metadata.closed_reason) {
-                statusKey = 'closed:' + mem.metadata.closed_reason;
-            }
-            var todoEl = document.querySelector('.legend-item.todo-status[data-todo-status="' + statusKey + '"]');
-            if (todoEl) todoEl.classList.add('selected');
-        }
-        // Handle regular memories with sections
-        else {
-            var section, subsection;
-            var hierarchy = mem.metadata.hierarchy;
-            if (hierarchy && hierarchy.path && hierarchy.path.length >= 1) {
-                section = hierarchy.path[0];
-                subsection = hierarchy.path.slice(1).join('/');
-            } else {
-                section = mem.metadata.section;
-                subsection = mem.metadata.subsection;
-            }
-            if (section) {
-                var sectionEl = document.querySelector('.section-item[data-section="' + section + '"]');
-                if (sectionEl) sectionEl.classList.add('selected');
-                if (subsection) {
-                    var path = section + '/' + subsection;
-                    var el = document.querySelector('.subsection-item[data-subsection="' + path + '"]');
-                    if (el) el.classList.add('selected');
-                }
-            }
-        }
-    }
+    highlightMemorySection(mem);
     updateTimelinePosition();
 }
 """
