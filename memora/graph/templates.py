@@ -806,6 +806,16 @@ function highlightMemoryInGraph(memId) {
               (typeof memoryCache !== 'undefined' && memoryCache[memId]) ? memoryCache[memId] : null;
     if (mem) {
         highlightMemorySection(mem);
+    } else {
+        // Fetch memory data if not in cache
+        fetch('/api/memories/' + memId)
+            .then(function(r) { return r.json(); })
+            .then(function(mem) {
+                if (!mem.error) {
+                    if (typeof memoryCache !== 'undefined') memoryCache[memId] = mem;
+                    highlightMemorySection(mem);
+                }
+            });
     }
 }
 
