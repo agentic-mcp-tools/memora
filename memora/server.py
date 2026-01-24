@@ -1,4 +1,5 @@
 """MCP-compatible memory server backed by SQLite."""
+
 from __future__ import annotations
 
 import argparse
@@ -12,14 +13,18 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
 from .storage import (
-    add_memory,
+    EDGE_TYPES,
+    _redact_secrets,
+    add_link,
     add_memories,
+    add_memory,
     boost_memory,
     clear_events,
     collect_all_tags,
     connect,
-    delete_memory,
     delete_memories,
+    delete_memory,
+    detect_clusters,
     export_memories,
     find_invalid_tag_entries,
     get_backend_info,
@@ -30,27 +35,23 @@ from .storage import (
     import_memories,
     list_memories,
     poll_events,
-    rebuild_embeddings,
     rebuild_crossrefs,
+    rebuild_embeddings,
+    remove_link,
     semantic_search,
     sync_to_cloud,
     update_crossrefs,
     update_memory,
-    _redact_secrets,
-    add_link,
-    remove_link,
-    detect_clusters,
-    EDGE_TYPES,
 )
 
 # Content type inference patterns
 TYPE_PATTERNS: List[tuple[str, str]] = [
-    (r'^(?:TODO|TASK)[:>\s]', 'todo'),
-    (r'^(?:BUG|ISSUE|FIX|ERROR)[:>\s]', 'issue'),
-    (r'^(?:NOTE|TIP|INFO)[:>\s]', 'note'),
-    (r'^(?:IDEA|FEATURE|ENHANCEMENT)[:>\s]', 'idea'),
-    (r'^(?:QUESTION|\?)[:>\s]', 'question'),
-    (r'^(?:WARN|WARNING|CAUTION)[:>\s]', 'warning'),
+    (r"^(?:TODO|TASK)[:>\s]", "todo"),
+    (r"^(?:BUG|ISSUE|FIX|ERROR)[:>\s]", "issue"),
+    (r"^(?:NOTE|TIP|INFO)[:>\s]", "note"),
+    (r"^(?:IDEA|FEATURE|ENHANCEMENT)[:>\s]", "idea"),
+    (r"^(?:QUESTION|\?)[:>\s]", "question"),
+    (r"^(?:WARN|WARNING|CAUTION)[:>\s]", "warning"),
 ]
 
 # Duplicate detection threshold
@@ -70,12 +71,12 @@ def _suggest_tags(content: str, inferred_type: Optional[str]) -> List[str]:
     suggestions = []
 
     # Type-based suggestions
-    if inferred_type == 'todo':
-        suggestions.append('memora/todos')
-    elif inferred_type == 'issue':
-        suggestions.append('memora/issues')
-    elif inferred_type in ('note', 'idea', 'question'):
-        suggestions.append('memora/knowledge')
+    if inferred_type == "todo":
+        suggestions.append("memora/todos")
+    elif inferred_type == "issue":
+        suggestions.append("memora/issues")
+    elif inferred_type in ("note", "idea", "question"):
+        suggestions.append("memora/knowledge")
 
     return suggestions
 
@@ -117,6 +118,7 @@ def _with_connection(func=None, *, writes=False):
     Args:
         writes: If True, syncs to cloud after operation. If False, skips sync (read-only).
     """
+
     def decorator(func):
         def wrapper(*args, **kwargs):
             conn = connect()
@@ -186,8 +188,16 @@ def _list_memories(
     sort_by_importance: bool = False,
 ):
     return list_memories(
-        conn, query, metadata_filters, limit, offset,
-        date_from, date_to, tags_any, tags_all, tags_none,
+        conn,
+        query,
+        metadata_filters,
+        limit,
+        offset,
+        date_from,
+        date_to,
+        tags_any,
+        tags_all,
+        tags_none,
         sort_by_importance=sort_by_importance,
     )
 
@@ -304,7 +314,7 @@ def _import_memories(conn, data: List[Dict[str, Any]], strategy: str):
 def _build_tag_hierarchy(tags):
     root = {"name": "root", "path": [], "children": {}, "tags": []}
     for tag in tags:
-        parts = tag.split('.')
+        parts = tag.split(".")
         node = root
         if not parts:
             continue
@@ -315,7 +325,7 @@ def _build_tag_hierarchy(tags):
                     "name": part,
                     "path": node["path"] + [part],
                     "children": {},
-                    "tags": []
+                    "tags": [],
                 }
             node = children[part]
         node.setdefault("tags", []).append(tag)
@@ -326,7 +336,9 @@ def _collapse_tag_tree(node):
     children_map = node.get("children", {})
     children_list = [_collapse_tag_tree(child) for child in children_map.values()]
     node["children"] = children_list
-    node["count"] = len(node.get("tags", [])) + sum(child["count"] for child in children_list)
+    node["count"] = len(node.get("tags", [])) + sum(
+        child["count"] for child in children_list
+    )
     return {key: value for key, value in node.items() if key != "children" or value}
 
 
@@ -397,13 +409,15 @@ def _suggest_hierarchy_from_similar(
     suggestions = []
     for path_tuple, total_score in sorted_paths[:max_suggestions]:
         path_list = list(path_tuple)
-        suggestions.append({
-            "path": path_list,
-            "section": path_list[0] if path_list else None,
-            "subsection": "/".join(path_list[1:]) if len(path_list) > 1 else None,
-            "confidence": round(total_score / len(similar_memories), 2),
-            "similar_memory_ids": path_examples[path_tuple][:3],
-        })
+        suggestions.append(
+            {
+                "path": path_list,
+                "section": path_list[0] if path_list else None,
+                "subsection": "/".join(path_list[1:]) if len(path_list) > 1 else None,
+                "confidence": round(total_score / len(similar_memories), 2),
+                "similar_memory_ids": path_examples[path_tuple][:3],
+            }
+        )
 
     return suggestions
 
@@ -436,7 +450,9 @@ def _get_existing_hierarchy_paths() -> List[List[str]]:
     return sorted([list(p) for p in paths_set], key=lambda x: (len(x), x))
 
 
-def _find_similar_paths(new_path: List[str], existing_paths: List[List[str]]) -> List[List[str]]:
+def _find_similar_paths(
+    new_path: List[str], existing_paths: List[List[str]]
+) -> List[List[str]]:
     """Find existing paths similar to new_path - siblings or paths with similar names."""
     if not new_path or not existing_paths:
         return []
@@ -473,7 +489,9 @@ def _find_similar_paths(new_path: List[str], existing_paths: List[List[str]]) ->
     return suggestions[:5]  # Limit to 5 suggestions
 
 
-def _build_hierarchy_tree(memories: List[Dict[str, Any]], include_root: bool = False, compact: bool = True) -> Any:
+def _build_hierarchy_tree(
+    memories: List[Dict[str, Any]], include_root: bool = False, compact: bool = True
+) -> Any:
     root: Dict[str, Any] = {
         "name": "root",
         "path": [],
@@ -510,7 +528,9 @@ def _build_hierarchy_tree(memories: List[Dict[str, Any]], include_root: bool = F
         children_map: Dict[str, Any] = node.get("children", {})
         children_list = [collapse(child) for child in children_map.values()]
         node["children"] = children_list
-        node["count"] = len(node.get("memories", [])) + sum(child["count"] for child in children_list)
+        node["count"] = len(node.get("memories", [])) + sum(
+            child["count"] for child in children_list
+        )
         return node
 
     collapsed = collapse(root)
@@ -554,7 +574,9 @@ async def memory_create(
         pass  # Don't fail on redaction errors
 
     try:
-        record = _create_memory(content=redacted_content, metadata=metadata, tags=tags or [])
+        record = _create_memory(
+            content=redacted_content, metadata=metadata, tags=tags or []
+        )
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -566,14 +588,20 @@ async def memory_create(
         if similar:
             warnings["new_hierarchy_path"] = f"New hierarchy path created: {new_path}"
             result["existing_similar_paths"] = similar
-            result["hint"] = "Did you mean to use one of these existing paths? Use memory_update to change if needed."
+            result["hint"] = (
+                "Did you mean to use one of these existing paths? Use memory_update to change if needed."
+            )
 
     # Use cross-refs (related memories) for consolidation hints and duplicate detection
     # Cross-refs use full embedding context (content + metadata + tags) so are more accurate
     related_memories = record.get("related", []) if record else []
     if suggest_similar and related_memories:
         # Filter by threshold
-        above_threshold = [m for m in related_memories if m and m.get("score", 0) >= similarity_threshold]
+        above_threshold = [
+            m
+            for m in related_memories
+            if m and m.get("score", 0) >= similarity_threshold
+        ]
         if above_threshold:
             result["similar_memories"] = above_threshold
             result["consolidation_hint"] = (
@@ -581,11 +609,13 @@ async def memory_create(
                 "Consider: (1) merge content with memory_update, or (2) delete redundant ones with memory_delete."
             )
             # Check for potential duplicates (>0.85 similarity)
-            duplicates = [m for m in above_threshold if m.get("score", 0) >= DUPLICATE_THRESHOLD]
+            duplicates = [
+                m for m in above_threshold if m.get("score", 0) >= DUPLICATE_THRESHOLD
+            ]
             if duplicates:
                 warnings["duplicate_warning"] = (
-                    f"Very similar memory exists (>={int(DUPLICATE_THRESHOLD*100)}% match). "
-                    f"Memory #{duplicates[0]['id']} has {int(duplicates[0]['score']*100)}% similarity."
+                    f"Very similar memory exists (>={int(DUPLICATE_THRESHOLD * 100)}% match). "
+                    f"Memory #{duplicates[0]['id']} has {int(duplicates[0]['score'] * 100)}% similarity."
                 )
 
     # Add warnings to result if any
@@ -650,20 +680,32 @@ async def memory_create_issue(
     # Validate status
     valid_statuses = {"open", "closed"}
     if status not in valid_statuses:
-        return {"error": "invalid_status", "message": f"Status must be one of: {', '.join(valid_statuses)}"}
+        return {
+            "error": "invalid_status",
+            "message": f"Status must be one of: {', '.join(valid_statuses)}",
+        }
 
     # Validate closed_reason if status is closed
     if status == "closed":
         valid_reasons = {"complete", "not_planned"}
         if not closed_reason:
-            return {"error": "missing_closed_reason", "message": "closed_reason required when status is 'closed'"}
+            return {
+                "error": "missing_closed_reason",
+                "message": "closed_reason required when status is 'closed'",
+            }
         if closed_reason not in valid_reasons:
-            return {"error": "invalid_closed_reason", "message": f"closed_reason must be one of: {', '.join(valid_reasons)}"}
+            return {
+                "error": "invalid_closed_reason",
+                "message": f"closed_reason must be one of: {', '.join(valid_reasons)}",
+            }
 
     # Validate severity
     valid_severities = {"critical", "major", "minor"}
     if severity not in valid_severities:
-        return {"error": "invalid_severity", "message": f"Severity must be one of: {', '.join(valid_severities)}"}
+        return {
+            "error": "invalid_severity",
+            "message": f"Severity must be one of: {', '.join(valid_severities)}",
+        }
 
     # Build metadata
     metadata: Dict[str, Any] = {
@@ -712,20 +754,32 @@ async def memory_create_todo(
     # Validate status
     valid_statuses = {"open", "closed"}
     if status not in valid_statuses:
-        return {"error": "invalid_status", "message": f"Status must be one of: {', '.join(valid_statuses)}"}
+        return {
+            "error": "invalid_status",
+            "message": f"Status must be one of: {', '.join(valid_statuses)}",
+        }
 
     # Validate closed_reason if status is closed
     if status == "closed":
         valid_reasons = {"complete", "not_planned"}
         if not closed_reason:
-            return {"error": "missing_closed_reason", "message": "closed_reason required when status is 'closed'"}
+            return {
+                "error": "missing_closed_reason",
+                "message": "closed_reason required when status is 'closed'",
+            }
         if closed_reason not in valid_reasons:
-            return {"error": "invalid_closed_reason", "message": f"closed_reason must be one of: {', '.join(valid_reasons)}"}
+            return {
+                "error": "invalid_closed_reason",
+                "message": f"closed_reason must be one of: {', '.join(valid_reasons)}",
+            }
 
     # Validate priority
     valid_priorities = {"high", "medium", "low"}
     if priority not in valid_priorities:
-        return {"error": "invalid_priority", "message": f"Priority must be one of: {', '.join(valid_priorities)}"}
+        return {
+            "error": "invalid_priority",
+            "message": f"Priority must be one of: {', '.join(valid_priorities)}",
+        }
 
     # Build metadata
     metadata: Dict[str, Any] = {
@@ -819,8 +873,15 @@ async def memory_list(
     """
     try:
         items = _list_memories(
-            query, metadata_filters, limit, offset,
-            date_from, date_to, tags_any, tags_all, tags_none,
+            query,
+            metadata_filters,
+            limit,
+            offset,
+            date_from,
+            date_to,
+            tags_any,
+            tags_all,
+            tags_none,
             sort_by_importance,
         )
     except ValueError as exc:
@@ -857,7 +918,17 @@ async def memory_list_compact(
         tags_none: Exclude memories with ANY of these tags (NOT logic)
     """
     try:
-        items = _list_memories(query, metadata_filters, limit, offset, date_from, date_to, tags_any, tags_all, tags_none)
+        items = _list_memories(
+            query,
+            metadata_filters,
+            limit,
+            offset,
+            date_from,
+            date_to,
+            tags_any,
+            tags_all,
+            tags_none,
+        )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
 
@@ -866,12 +937,14 @@ async def memory_list_compact(
     for item in items:
         content = item.get("content", "")
         preview = content[:80] + "..." if len(content) > 80 else content
-        compact_items.append({
-            "id": item["id"],
-            "preview": preview,
-            "tags": item.get("tags", []),
-            "created_at": item.get("created_at"),
-        })
+        compact_items.append(
+            {
+                "id": item["id"],
+                "preview": preview,
+                "tags": item.get("tags", []),
+                "created_at": item.get("created_at"),
+            }
+        )
 
     return {"count": len(compact_items), "memories": compact_items}
 
@@ -966,7 +1039,11 @@ async def memory_validate_tags(include_memories: bool = True) -> Dict[str, Any]:
     invalid_full = _find_invalid_tags()
     allowed = list_allowed_tags()
     existing = _collect_tags()
-    response: Dict[str, Any] = {"allowed": allowed, "existing": existing, "invalid_count": len(invalid_full)}
+    response: Dict[str, Any] = {
+        "allowed": allowed,
+        "existing": existing,
+        "invalid_count": len(invalid_full),
+    }
     if include_memories:
         response["invalid"] = invalid_full
     return response
@@ -991,7 +1068,17 @@ async def memory_hierarchy(
                  per memory to reduce response size. Set to False for full memory data.
     """
     try:
-        items = _list_memories(query, metadata_filters, None, 0, date_from, date_to, tags_any, tags_all, tags_none)
+        items = _list_memories(
+            query,
+            metadata_filters,
+            None,
+            0,
+            date_from,
+            date_to,
+            tags_any,
+            tags_all,
+            tags_none,
+        )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
 
@@ -1240,10 +1327,12 @@ async def memory_find_duplicates(
         - analyzed: Number of pairs analyzed with LLM
         - llm_available: Whether LLM comparison was available
     """
-    from .storage import find_duplicate_candidates, compare_memories_llm, connect
+    from .storage import compare_memories_llm, connect, find_duplicate_candidates
 
     with connect() as conn:
-        candidates = find_duplicate_candidates(conn, min_similarity, max_similarity, limit * 2)
+        candidates = find_duplicate_candidates(
+            conn, min_similarity, max_similarity, limit * 2
+        )
 
     total_candidates = len(candidates)
     pairs = []
@@ -1259,12 +1348,16 @@ async def memory_find_duplicates(
         pair_result = {
             "memory_a": {
                 "id": mem_a["id"],
-                "preview": mem_a["content"][:150] + "..." if len(mem_a["content"]) > 150 else mem_a["content"],
+                "preview": mem_a["content"][:150] + "..."
+                if len(mem_a["content"]) > 150
+                else mem_a["content"],
                 "tags": mem_a.get("tags", []),
             },
             "memory_b": {
                 "id": mem_b["id"],
-                "preview": mem_b["content"][:150] + "..." if len(mem_b["content"]) > 150 else mem_b["content"],
+                "preview": mem_b["content"][:150] + "..."
+                if len(mem_b["content"]) > 150
+                else mem_b["content"],
                 "tags": mem_b.get("tags", []),
             },
             "similarity_score": round(candidate["similarity_score"], 3),
@@ -1283,7 +1376,9 @@ async def memory_find_duplicates(
                 pair_result["llm_verdict"] = llm_result.get("verdict", "review")
                 pair_result["llm_confidence"] = llm_result.get("confidence", 0)
                 pair_result["llm_reasoning"] = llm_result.get("reasoning", "")
-                pair_result["suggested_action"] = llm_result.get("suggested_action", "review")
+                pair_result["suggested_action"] = llm_result.get(
+                    "suggested_action", "review"
+                )
                 if llm_result.get("merge_suggestion"):
                     pair_result["merge_suggestion"] = llm_result["merge_suggestion"]
 
@@ -1318,15 +1413,21 @@ async def memory_merge(
     Returns:
         Updated target memory and deletion confirmation
     """
-    from .storage import connect, update_memory, delete_memory
+    from .storage import connect, delete_memory, update_memory
 
     source = _get_memory(source_id)
     target = _get_memory(target_id)
 
     if not source:
-        return {"error": "not_found", "message": f"Source memory #{source_id} not found"}
+        return {
+            "error": "not_found",
+            "message": f"Source memory #{source_id} not found",
+        }
     if not target:
-        return {"error": "not_found", "message": f"Target memory #{target_id} not found"}
+        return {
+            "error": "not_found",
+            "message": f"Target memory #{target_id} not found",
+        }
 
     # Combine content based on strategy
     if merge_strategy == "prepend":
@@ -1399,8 +1500,8 @@ async def memory_upload_image(
     Returns:
         Dictionary with r2_url (the r2:// reference) and image object ready for metadata
     """
-    import os
     import mimetypes
+    import os
 
     from .image_storage import get_image_storage_instance
 
@@ -1469,6 +1570,7 @@ async def memory_migrate_images(dry_run: bool = False) -> Dict[str, Any]:
 def _migrate_images_to_r2(conn, dry_run: bool = False) -> Dict[str, Any]:
     """Migrate all base64 images to R2 storage."""
     import json as json_lib
+
     from .image_storage import get_image_storage_instance, parse_data_uri
     from .storage import update_memory
 
@@ -1485,7 +1587,11 @@ def _migrate_images_to_r2(conn, dry_run: bool = False) -> Dict[str, Any]:
     ).fetchall()
 
     if not rows:
-        return {"migrated_memories": 0, "migrated_images": 0, "message": "No base64 images found"}
+        return {
+            "migrated_memories": 0,
+            "migrated_images": 0,
+            "message": "No base64 images found",
+        }
 
     results = {
         "dry_run": dry_run,
@@ -1532,11 +1638,13 @@ def _migrate_images_to_r2(conn, dry_run: bool = False) -> Dict[str, Any]:
                 results["migrated_images"] += 1
                 updated = True
             except Exception as e:
-                results["errors"].append({
-                    "memory_id": memory_id,
-                    "image_index": idx,
-                    "error": str(e),
-                })
+                results["errors"].append(
+                    {
+                        "memory_id": memory_id,
+                        "image_index": idx,
+                        "error": str(e),
+                    }
+                )
 
         if updated:
             results["migrated_memories"] += 1
@@ -1545,9 +1653,13 @@ def _migrate_images_to_r2(conn, dry_run: bool = False) -> Dict[str, Any]:
                 update_memory(conn, memory_id, metadata=metadata)
 
     if dry_run:
-        results["message"] = f"Would migrate {results['migrated_images']} images from {results['migrated_memories']} memories"
+        results["message"] = (
+            f"Would migrate {results['migrated_images']} images from {results['migrated_memories']} memories"
+        )
     else:
-        results["message"] = f"Migrated {results['migrated_images']} images from {results['migrated_memories']} memories"
+        results["message"] = (
+            f"Migrated {results['migrated_images']} images from {results['migrated_memories']} memories"
+        )
 
     return results
 
@@ -1571,6 +1683,7 @@ async def memory_export_graph(
         Dictionary with path, node count, edge count, and tags
     """
     import os
+
     if output_path is None:
         output_path = os.path.expanduser("~/memories_graph.html")
 
@@ -1578,9 +1691,6 @@ async def memory_export_graph(
 
 
 # Removed ~400 lines of old _export_graph_html code - now in graph/data.py
-
-
-
 
 
 @mcp.tool()
@@ -1653,6 +1763,252 @@ async def memory_events_clear(event_ids: List[int]) -> Dict[str, Any]:
 # Graph functions moved to memora/graph/ module
 
 
+# =============================================================================
+# Project Context Tools - AI Instruction File Discovery & Ingestion
+# =============================================================================
+
+from .project_context import (
+    CORE_INSTRUCTION_FILES,
+    ProjectContextConfig,
+    discover_instruction_files,
+    find_existing_context_memories,
+    scan_project_context,
+    update_or_create_context_memory,
+)
+
+
+@_with_connection(writes=True)
+def _scan_project(
+    conn,
+    path: str,
+    extract_sections: bool,
+    scan_parents: bool,
+    force_rescan: bool,
+) -> Dict[str, Any]:
+    """Internal function to scan project and create/update memories."""
+    from pathlib import Path
+
+    config = ProjectContextConfig(
+        extract_sections=extract_sections,
+        scan_parents=scan_parents,
+    )
+
+    # Get memories to create
+    memories = scan_project_context(path, config)
+
+    if not memories:
+        return {
+            "status": "no_files_found",
+            "path": path,
+            "scanned_patterns": list(CORE_INSTRUCTION_FILES.keys()),
+        }
+
+    # Find existing context memories for this project
+    existing = find_existing_context_memories(conn, path)
+
+    results = {
+        "created": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "moved": 0,
+        "errors": [],
+        "memories": [],
+    }
+
+    for memory_data in memories:
+        try:
+            action, memory_id = update_or_create_context_memory(
+                conn, memory_data, existing
+            )
+            results[action] = results.get(action, 0) + 1
+            if memory_id and action in ("created", "updated"):
+                results["memories"].append(
+                    {
+                        "id": memory_id,
+                        "action": action,
+                        "source": memory_data.get("metadata", {}).get(
+                            "source_file", ""
+                        ),
+                        "section": memory_data.get("metadata", {}).get(
+                            "section_path", ""
+                        ),
+                    }
+                )
+        except Exception as e:
+            results["errors"].append(
+                {
+                    "source": memory_data.get("metadata", {}).get("source_file", ""),
+                    "error": str(e),
+                }
+            )
+
+    results["path"] = path
+    results["total_processed"] = len(memories)
+
+    return results
+
+
+@mcp.tool()
+async def memory_scan_project(
+    path: Optional[str] = None,
+    extract_sections: bool = True,
+    scan_parents: bool = False,
+    force_rescan: bool = False,
+) -> Dict[str, Any]:
+    """Scan current directory for AI instruction files and ingest them as memories.
+
+    Discovers and parses AI instruction files (CLAUDE.md, .cursorrules, AGENTS.md, etc.)
+    and creates searchable memories for each file and section.
+
+    Supported files:
+    - CLAUDE.md - Claude Code instructions
+    - AGENTS.md - Multi-agent system instructions
+    - .cursorrules - Cursor IDE rules
+    - .github/copilot-instructions.md - GitHub Copilot instructions
+    - GEMINI.md - Gemini tools instructions
+    - .aider.conf.yml - Aider configuration
+    - CONVENTIONS.md, CODING_GUIDELINES.md - General conventions
+    - .windsurfrules - Windsurf IDE rules
+
+    Args:
+        path: Directory to scan (default: current working directory)
+        extract_sections: Parse markdown into separate section memories (default: True)
+        scan_parents: Also scan parent directories (default: False for security)
+        force_rescan: Force update even if file hasn't changed (default: False)
+
+    Returns:
+        Dictionary with counts of created/updated/unchanged memories and details
+    """
+    import os
+
+    if path is None:
+        path = os.getcwd()
+
+    return _scan_project(path, extract_sections, scan_parents, force_rescan)
+
+
+@_with_connection
+def _get_project_context(
+    conn,
+    path: str,
+    include_sections: bool,
+) -> Dict[str, Any]:
+    """Internal function to get project context memories."""
+    existing = find_existing_context_memories(conn, path)
+
+    if not existing:
+        return {
+            "count": 0,
+            "memories": [],
+            "path": path,
+            "hint": "No project context found. Run memory_scan_project to ingest instruction files.",
+        }
+
+    # Filter by type if needed
+    if not include_sections:
+        existing = [
+            m for m in existing if m.get("metadata", {}).get("is_parent", False)
+        ]
+
+    # Return compact format
+    compact_memories = []
+    for mem in existing:
+        metadata = mem.get("metadata", {})
+        content = mem.get("content", "")
+        preview = content[:200] + "..." if len(content) > 200 else content
+
+        compact_memories.append(
+            {
+                "id": mem["id"],
+                "preview": preview,
+                "tags": mem.get("tags", []),
+                "source_file": metadata.get("source_file", ""),
+                "file_type": metadata.get("file_type", ""),
+                "section_path": metadata.get("section_path", ""),
+                "is_section": metadata.get("is_section", False),
+            }
+        )
+
+    return {
+        "count": len(compact_memories),
+        "memories": compact_memories,
+        "path": path,
+    }
+
+
+@mcp.tool()
+async def memory_get_project_context(
+    path: Optional[str] = None,
+    include_sections: bool = True,
+) -> Dict[str, Any]:
+    """Get all project context memories for a directory.
+
+    Retrieves previously ingested AI instruction file memories for a project.
+    Use memory_scan_project first to ingest files.
+
+    Args:
+        path: Directory path (default: current working directory)
+        include_sections: Include section-level memories (default: True)
+
+    Returns:
+        Dictionary with count and list of project context memories
+    """
+    import os
+
+    if path is None:
+        path = os.getcwd()
+
+    return _get_project_context(path, include_sections)
+
+
+@mcp.tool()
+async def memory_list_instruction_files(
+    path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """List AI instruction files discovered in a directory (without ingesting).
+
+    Scans for known instruction file patterns without creating memories.
+    Useful for previewing what would be ingested.
+
+    Args:
+        path: Directory to scan (default: current working directory)
+
+    Returns:
+        Dictionary with list of discovered files and their types
+    """
+    import os
+    from pathlib import Path
+
+    if path is None:
+        path = os.getcwd()
+
+    files = discover_instruction_files(path)
+
+    file_info = []
+    for file_path, file_type, file_format in files:
+        try:
+            stat = file_path.stat()
+            file_info.append(
+                {
+                    "path": str(file_path),
+                    "name": file_path.name,
+                    "type": file_type.value,
+                    "format": file_format.value,
+                    "size_bytes": stat.st_size,
+                    "modified": stat.st_mtime,
+                }
+            )
+        except Exception:
+            continue
+
+    return {
+        "count": len(file_info),
+        "files": file_info,
+        "path": path,
+        "supported_patterns": list(CORE_INSTRUCTION_FILES.keys()),
+    }
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Memory MCP Server")
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -1689,37 +2045,30 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # Subcommand: sync-pull
     sync_pull_parser = subparsers.add_parser(
-        "sync-pull",
-        help="Force pull database from cloud storage (ignore local cache)"
+        "sync-pull", help="Force pull database from cloud storage (ignore local cache)"
     )
 
     # Subcommand: sync-push
     sync_push_parser = subparsers.add_parser(
-        "sync-push",
-        help="Force push database to cloud storage"
+        "sync-push", help="Force push database to cloud storage"
     )
 
     # Subcommand: sync-status
     sync_status_parser = subparsers.add_parser(
-        "sync-status",
-        help="Show sync status and backend information"
+        "sync-status", help="Show sync status and backend information"
     )
 
     # Subcommand: info
-    info_parser = subparsers.add_parser(
-        "info",
-        help="Show storage backend information"
-    )
+    info_parser = subparsers.add_parser("info", help="Show storage backend information")
 
     # Subcommand: migrate-images
     migrate_parser = subparsers.add_parser(
-        "migrate-images",
-        help="Migrate base64 images to R2 storage"
+        "migrate-images", help="Migrate base64 images to R2 storage"
     )
     migrate_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would be migrated without making changes"
+        help="Show what would be migrated without making changes",
     )
 
     args = parser.parse_args(argv)
@@ -1744,6 +2093,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         # This prevents "connection failed" on first MCP connection
         try:
             import sys
+
             print("Initializing database...", file=sys.stderr)
             conn = connect()
             conn.close()
@@ -1761,6 +2111,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 def _handle_sync_pull() -> None:
     """Handle sync-pull command."""
     import json
+
     from .backends import CloudSQLiteBackend
     from .storage import STORAGE_BACKEND
 
@@ -1785,6 +2136,7 @@ def _handle_sync_pull() -> None:
 def _handle_sync_push() -> None:
     """Handle sync-push command."""
     import json
+
     from .backends import CloudSQLiteBackend
     from .storage import STORAGE_BACKEND
 
@@ -1809,11 +2161,12 @@ def _handle_sync_push() -> None:
 def _handle_sync_status() -> None:
     """Handle sync-status command."""
     import json
+
     from .backends import CloudSQLiteBackend
     from .storage import STORAGE_BACKEND
 
     info = STORAGE_BACKEND.get_info()
-    backend_type = info.get('backend_type', 'unknown')
+    backend_type = info.get("backend_type", "unknown")
 
     print(f"Storage Backend: {backend_type}")
     print()
@@ -1843,6 +2196,7 @@ def _handle_sync_status() -> None:
 def _handle_info() -> None:
     """Handle info command."""
     import json
+
     from .storage import STORAGE_BACKEND
 
     info = STORAGE_BACKEND.get_info()
