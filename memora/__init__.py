@@ -1,8 +1,8 @@
 """Memory MCP server package."""
 
-from pathlib import Path as _Path
 import json
 import os
+from pathlib import Path as _Path
 
 DEFAULT_TAGS = {
     "general",
@@ -32,7 +32,9 @@ def _load_tag_whitelist() -> set[str]:
     env_list = os.getenv("MEMORA_TAGS")
 
     if not file_path:
-        default_file = _Path(__file__).resolve().parent.parent / 'config' / 'allowed_tags.json'
+        default_file = (
+            _Path(__file__).resolve().parent.parent / "config" / "allowed_tags.json"
+        )
         file_path = str(default_file) if default_file.exists() else None
 
     if file_path:
@@ -49,7 +51,7 @@ def _load_tag_whitelist() -> set[str]:
             return set(DEFAULT_TAGS)
 
     if env_list:
-        parsed = {part.strip() for part in env_list.split(',') if part.strip()}
+        parsed = {part.strip() for part in env_list.split(",") if part.strip()}
         if parsed:
             return parsed
 
@@ -65,4 +67,4 @@ def list_allowed_tags() -> list[str]:
     return sorted(TAG_WHITELIST)
 
 
-__all__ = ["server", "storage", "TAG_WHITELIST", "list_allowed_tags"]
+__all__ = ["TAG_WHITELIST", "list_allowed_tags"]

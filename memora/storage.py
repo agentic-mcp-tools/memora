@@ -1,4 +1,5 @@
 """SQLite storage helpers shared by memory servers."""
+
 from __future__ import annotations
 
 import base64
@@ -9,15 +10,16 @@ import mimetypes
 import os
 import re
 import sqlite3
-
-from PIL import Image
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence as TypingSequence
+from typing import Any, Dict, Iterable, List, Optional
+from typing import Sequence as TypingSequence
 
-from .backends import StorageBackend, parse_backend_uri, D1Connection
+from PIL import Image
+
+from .backends import D1Connection, StorageBackend, parse_backend_uri
 
 ROOT = Path(__file__).resolve().parent
 
@@ -35,10 +37,13 @@ else:
     else:
         DB_PATH = Path.home() / ".local" / "share" / "memora" / "memories.db"
     from .backends import LocalSQLiteBackend
+
     STORAGE_BACKEND = LocalSQLiteBackend(DB_PATH)
 
 # Embedding backend configuration
-EMBEDDING_MODEL = os.getenv("MEMORA_EMBEDDING_MODEL", "openai")  # openai, sentence-transformers, tfidf
+EMBEDDING_MODEL = os.getenv(
+    "MEMORA_EMBEDDING_MODEL", "openai"
+)  # openai, sentence-transformers, tfidf
 
 # LLM configuration for deduplication comparison
 LLM_ENABLED = os.getenv("MEMORA_LLM_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -51,21 +56,33 @@ EVENT_TRIGGER_TAG = "shared-cache"
 MIN_CONTENT_LENGTH = 3
 MAX_CONTENT_LENGTH = 50000  # ~50KB text
 
+# Memory tier configuration
+VALID_TIERS = {"daily", "permanent"}
+DEFAULT_TIER = "permanent"
+
+# Embedding cache configuration
+EMBEDDING_CACHE_ENABLED = os.getenv("MEMORA_EMBEDDING_CACHE", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+EMBEDDING_CACHE_MAX_ENTRIES = int(os.getenv("MEMORA_EMBEDDING_CACHE_SIZE", "50000"))
+
 # Secret/PII detection patterns (warn only, don't block)
 SECRET_PATTERNS: List[tuple[str, str]] = [
-    (r'sk-(?:proj-)?[a-zA-Z0-9]{20,}', 'OpenAI API key'),
-    (r'sk-or-[a-zA-Z0-9-]{20,}', 'OpenRouter API key'),
-    (r'sk-ant-[a-zA-Z0-9-]{20,}', 'Anthropic API key'),
-    (r'AKIA[0-9A-Z]{16}', 'AWS Access Key'),
-    (r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----', 'Private key'),
-    (r'Bearer [a-zA-Z0-9_-]{20,}', 'Bearer token'),
-    (r'ghp_[a-zA-Z0-9]{36}', 'GitHub PAT'),
-    (r'gho_[a-zA-Z0-9]{36}', 'GitHub OAuth token'),
-    (r'github_pat_[a-zA-Z0-9_]{22,}', 'GitHub fine-grained PAT'),
-    (r'xox[baprs]-[a-zA-Z0-9-]{10,}', 'Slack token'),
-    (r'(?i)password\s*[:=]\s*[^\s]{4,}', 'Password in plaintext'),
-    (r'(?i)secret\s*[:=]\s*[^\s]{4,}', 'Secret in plaintext'),
-    (r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b', 'Credit card number'),
+    (r"sk-(?:proj-)?[a-zA-Z0-9]{20,}", "OpenAI API key"),
+    (r"sk-or-[a-zA-Z0-9-]{20,}", "OpenRouter API key"),
+    (r"sk-ant-[a-zA-Z0-9-]{20,}", "Anthropic API key"),
+    (r"AKIA[0-9A-Z]{16}", "AWS Access Key"),
+    (r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", "Private key"),
+    (r"Bearer [a-zA-Z0-9_-]{20,}", "Bearer token"),
+    (r"ghp_[a-zA-Z0-9]{36}", "GitHub PAT"),
+    (r"gho_[a-zA-Z0-9]{36}", "GitHub OAuth token"),
+    (r"github_pat_[a-zA-Z0-9_]{22,}", "GitHub fine-grained PAT"),
+    (r"xox[baprs]-[a-zA-Z0-9-]{10,}", "Slack token"),
+    (r"(?i)password\s*[:=]\s*[^\s]{4,}", "Password in plaintext"),
+    (r"(?i)secret\s*[:=]\s*[^\s]{4,}", "Secret in plaintext"),
+    (r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b", "Credit card number"),
 ]
 
 
@@ -84,9 +101,198 @@ def _redact_secrets(content: str) -> tuple[str, List[str]]:
     result = content
     for pattern, description in SECRET_PATTERNS:
         if re.search(pattern, result):
-            result = re.sub(pattern, '[REDACTED]', result)
+            result = re.sub(pattern, "[REDACTED]", result)
             redacted.append(description)
     return result, redacted
+
+
+def soft_trim(
+    content: str,
+    max_length: int = 500,
+    head_ratio: float = 0.6,
+    tail_ratio: float = 0.3,
+) -> str:
+    """
+    Soft-trim content, preserving head and tail with ellipsis in the middle.
+
+    This is useful for displaying long content while keeping both the beginning
+    (which often contains key context) and the end (which may have conclusions).
+
+    Args:
+        content: The content to trim
+        max_length: Maximum output length (default: 500 chars)
+        head_ratio: Proportion of max_length for head (default: 0.6 = 60%)
+        tail_ratio: Proportion of max_length for tail (default: 0.3 = 30%)
+                   The remaining 10% is reserved for the ellipsis message.
+
+    Returns:
+        Original content if within max_length, or trimmed with ellipsis.
+
+    Example:
+        >>> soft_trim("A" * 1000, max_length=100)
+        'AAAAAA...\\n...[840 chars truncated]...\\nAAAAA'
+    """
+    if len(content) <= max_length:
+        return content
+
+    # Calculate sizes
+    head_size = int(max_length * head_ratio)
+    tail_size = int(max_length * tail_ratio)
+    truncated_chars = len(content) - head_size - tail_size
+
+    # Build the trimmed result
+    head = content[:head_size].rstrip()
+    tail = content[-tail_size:].lstrip() if tail_size > 0 else ""
+
+    if tail:
+        return f"{head}\n...[{truncated_chars} chars truncated]...\n{tail}"
+    else:
+        return f"{head}\n...[{truncated_chars} chars truncated]..."
+
+
+def content_preview(content: str, max_length: int = 200) -> str:
+    """
+    Generate a preview of content for compact listings.
+
+    Unlike soft_trim, this just takes the beginning and adds ellipsis.
+
+    Args:
+        content: The content to preview
+        max_length: Maximum preview length (default: 200 chars)
+
+    Returns:
+        Content truncated to max_length with "..." if needed.
+    """
+    if len(content) <= max_length:
+        return content
+    return content[:max_length].rstrip() + "..."
+
+
+# ---------------------------------------------------------------------------
+# Conversation Chunking for Session Transcript Indexing
+# ---------------------------------------------------------------------------
+
+
+def chunk_conversation(
+    messages: List[Dict[str, Any]],
+    chunk_size: int = 10,
+    overlap: int = 2,
+    include_metadata: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Split conversation messages into overlapping chunks for indexing.
+
+    Creates chunks of messages with overlap to maintain context across chunk
+    boundaries. Each chunk can be indexed as a separate memory for semantic search.
+
+    Args:
+        messages: List of message dicts with 'role', 'content', and optional 'timestamp'
+        chunk_size: Number of messages per chunk (default: 10)
+        overlap: Number of messages to overlap between chunks (default: 2)
+        include_metadata: Include chunk metadata (index, total_chunks, message_range)
+
+    Returns:
+        List of chunk dicts with:
+        - content: Formatted text of the chunk
+        - messages: Original message dicts in this chunk
+        - chunk_index: 0-based chunk number
+        - total_chunks: Total number of chunks
+        - message_range: (start_index, end_index) of messages in this chunk
+
+    Example:
+        >>> messages = [{"role": "user", "content": "Hello"}, ...]
+        >>> chunks = chunk_conversation(messages, chunk_size=5, overlap=1)
+        >>> len(chunks)  # Number of chunks
+        3
+    """
+    if not messages:
+        return []
+
+    # Validate overlap
+    if overlap >= chunk_size:
+        overlap = chunk_size - 1
+
+    chunks = []
+    step = chunk_size - overlap
+
+    # Calculate total chunks
+    if len(messages) <= chunk_size:
+        total_chunks = 1
+    else:
+        total_chunks = max(1, (len(messages) - overlap + step - 1) // step)
+
+    chunk_index = 0
+    for i in range(0, len(messages), step):
+        chunk_messages = messages[i : i + chunk_size]
+        if not chunk_messages:
+            break
+
+        # Format messages as text
+        formatted_lines = []
+        for msg in chunk_messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            timestamp = msg.get("timestamp", "")
+
+            if timestamp:
+                formatted_lines.append(f"[{timestamp}] {role}: {content}")
+            else:
+                formatted_lines.append(f"{role}: {content}")
+
+        chunk_content = "\n".join(formatted_lines)
+
+        chunk_data = {
+            "content": chunk_content,
+            "messages": chunk_messages,
+        }
+
+        if include_metadata:
+            chunk_data.update(
+                {
+                    "chunk_index": chunk_index,
+                    "total_chunks": total_chunks,
+                    "message_range": (i, i + len(chunk_messages) - 1),
+                }
+            )
+
+        chunks.append(chunk_data)
+        chunk_index += 1
+
+        # Stop if we've covered all messages
+        if i + chunk_size >= len(messages):
+            break
+
+    return chunks
+
+
+def format_conversation_chunk(
+    messages: List[Dict[str, Any]],
+    include_timestamps: bool = True,
+    separator: str = "\n",
+) -> str:
+    """
+    Format a list of messages into a single string for embedding.
+
+    Args:
+        messages: List of message dicts with 'role', 'content', and optional 'timestamp'
+        include_timestamps: Include timestamps in the formatted output
+        separator: Separator between messages (default: newline)
+
+    Returns:
+        Formatted string representation of the messages.
+    """
+    formatted_lines = []
+    for msg in messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        timestamp = msg.get("timestamp", "")
+
+        if include_timestamps and timestamp:
+            formatted_lines.append(f"[{timestamp}] {role}: {content}")
+        else:
+            formatted_lines.append(f"{role}: {content}")
+
+    return separator.join(formatted_lines)
 
 
 def _validate_content(content: str) -> str:
@@ -98,7 +304,7 @@ def _validate_content(content: str) -> str:
     content = content.strip()
 
     # Normalize excessive newlines (max 2 consecutive)
-    content = re.sub(r'\n{3,}', '\n\n', content)
+    content = re.sub(r"\n{3,}", "\n\n", content)
 
     # Length validation
     if len(content) < MIN_CONTENT_LENGTH:
@@ -115,21 +321,43 @@ def _validate_content(content: str) -> str:
 
 # Keywords that suggest content is about a bug/issue
 _ISSUE_KEYWORDS = [
-    "bug", "fix", "fixed", "error", "crash", "broken", "resolve", "resolved",
-    "problem", "issue", "fault", "defect", "patch", "hotfix", "regression",
+    "bug",
+    "fix",
+    "fixed",
+    "error",
+    "crash",
+    "broken",
+    "resolve",
+    "resolved",
+    "problem",
+    "issue",
+    "fault",
+    "defect",
+    "patch",
+    "hotfix",
+    "regression",
 ]
 
 # Keywords that suggest content is a TODO/task
 _TODO_KEYWORDS = [
-    "todo", "task", "implement", "add feature", "need to", "should add",
-    "plan to", "will add", "must add", "want to add", "roadmap",
+    "todo",
+    "task",
+    "implement",
+    "add feature",
+    "need to",
+    "should add",
+    "plan to",
+    "will add",
+    "must add",
+    "want to add",
+    "roadmap",
 ]
 
 # Patterns that strongly suggest closed/resolved issues
 _RESOLVED_PATTERNS = [
     r"\*\*fix\*\*",  # **Fix** or **fix**
     r"fix(?:ed)?:",  # Fix: or Fixed:
-    r"resolved?:",   # Resolve: or Resolved:
+    r"resolved?:",  # Resolve: or Resolved:
     r"problem:.*(?:fix|solution)",  # Problem: ... fix/solution
     r"root cause:",  # Root cause analysis
 ]
@@ -232,7 +460,7 @@ def _emit_event(conn: sqlite3.Connection, memory_id: int, tags: List[str]) -> No
         try:
             conn.execute(
                 "INSERT INTO memories_events (memory_id, tags) VALUES (?, ?)",
-                (memory_id, tags_json)
+                (memory_id, tags_json),
             )
             conn.commit()
         except Exception:
@@ -294,6 +522,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_events_table(conn)
     _ensure_importance_columns(conn)
     _ensure_updated_at_column(conn)
+    _ensure_tier_columns(conn)
+    _ensure_workspace_column(conn)
+    _ensure_embedding_cache_table(conn)
+    _ensure_sync_tables(conn)
+    _ensure_share_events_table(conn)
+    _ensure_session_tables(conn)
+    _ensure_identity_tables(conn)
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
@@ -392,6 +627,334 @@ def _ensure_updated_at_column(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _ensure_tier_columns(conn: sqlite3.Connection) -> None:
+    """Add tier and expires_at columns to memories table if they don't exist."""
+    cursor = conn.execute("PRAGMA table_info(memories)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "tier" not in columns:
+        conn.execute(
+            f"ALTER TABLE memories ADD COLUMN tier TEXT DEFAULT '{DEFAULT_TIER}'"
+        )
+
+    if "expires_at" not in columns:
+        conn.execute("ALTER TABLE memories ADD COLUMN expires_at TEXT")
+
+    conn.commit()
+
+
+def _ensure_workspace_column(conn: sqlite3.Connection) -> None:
+    """Add workspace column to memories table for multi-workspace support."""
+    cursor = conn.execute("PRAGMA table_info(memories)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "workspace" not in columns:
+        conn.execute("ALTER TABLE memories ADD COLUMN workspace TEXT DEFAULT 'default'")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memories_workspace
+            ON memories(workspace)
+            """
+        )
+        conn.commit()
+
+
+# Default workspace name
+DEFAULT_WORKSPACE = "default"
+
+
+def _ensure_embedding_cache_table(conn: sqlite3.Connection) -> None:
+    """Create embedding cache table for LRU caching of embeddings."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS embedding_cache (
+            content_hash TEXT PRIMARY KEY,
+            embedding TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
+            access_count INTEGER DEFAULT 1
+        )
+        """
+    )
+    # Index for LRU eviction (oldest entries first)
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_embedding_cache_lru
+        ON embedding_cache(last_accessed)
+        """
+    )
+    conn.commit()
+
+
+def _ensure_share_events_table(conn: sqlite3.Connection) -> None:
+    """Create table for cross-session memory sharing."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS share_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            source_agent TEXT,
+            target_agents TEXT,
+            message TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            acknowledged_by TEXT,
+            FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_share_events_memory
+        ON share_events(memory_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_share_events_created
+        ON share_events(created_at)
+        """
+    )
+    conn.commit()
+
+
+def _ensure_sync_tables(conn: sqlite3.Connection) -> None:
+    """Create tables for sync version tracking and delta sync."""
+    cursor = conn.execute("PRAGMA table_info(memories)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    # Add sync_version column to memories if not exists
+    if "sync_version" not in columns:
+        conn.execute("ALTER TABLE memories ADD COLUMN sync_version INTEGER DEFAULT 0")
+
+    # Create global sync version counter
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    # Initialize global version if not exists
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO sync_metadata (key, value) VALUES ('global_version', '0')
+        """
+    )
+
+    # Create sync state table for tracking agent sync positions
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_state (
+            agent_id TEXT PRIMARY KEY,
+            last_sync_version INTEGER NOT NULL DEFAULT 0,
+            last_sync_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+
+    # Create deleted memories tracking table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deleted_memories (
+            memory_id INTEGER PRIMARY KEY,
+            content_preview TEXT,
+            deleted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            sync_version INTEGER NOT NULL
+        )
+        """
+    )
+
+    # Index for efficient delta queries
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memories_sync_version
+        ON memories(sync_version)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_deleted_memories_sync_version
+        ON deleted_memories(sync_version)
+        """
+    )
+
+    conn.commit()
+
+
+def _ensure_identity_tables(conn: sqlite3.Connection) -> None:
+    """Create tables for identity linking (entity unification)."""
+    # Create identities table for canonical entities
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identities (
+            canonical_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            entity_type TEXT DEFAULT 'person',
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+
+    # Create identity_aliases table for alternative names/IDs
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identity_aliases (
+            alias TEXT PRIMARY KEY,
+            canonical_id TEXT NOT NULL,
+            source TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(canonical_id) REFERENCES identities(canonical_id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    # Create memory_identity_links table to link memories to identities
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_identity_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            identity_id TEXT NOT NULL,
+            mention_text TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+            FOREIGN KEY(identity_id) REFERENCES identities(canonical_id) ON DELETE CASCADE,
+            UNIQUE(memory_id, identity_id)
+        )
+        """
+    )
+
+    # Create indexes for efficient lookups
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_identity_aliases_canonical
+        ON identity_aliases(canonical_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memory_identity_links_memory
+        ON memory_identity_links(memory_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memory_identity_links_identity
+        ON memory_identity_links(identity_id)
+        """
+    )
+
+    conn.commit()
+
+
+def _ensure_session_tables(conn: sqlite3.Connection) -> None:
+    """Create tables for session transcript indexing."""
+    # Create sessions table to track indexed sessions
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            title TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_indexed_at TEXT,
+            message_count INTEGER DEFAULT 0,
+            chunk_count INTEGER DEFAULT 0,
+            metadata TEXT DEFAULT '{}'
+        )
+        """
+    )
+
+    # Create session_chunks table for indexed conversation chunks
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            message_start INTEGER NOT NULL,
+            message_end INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            memory_id INTEGER,
+            FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+            FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE SET NULL,
+            UNIQUE(session_id, chunk_index)
+        )
+        """
+    )
+
+    # Create index for efficient session lookups
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_session_chunks_session_id
+        ON session_chunks(session_id)
+        """
+    )
+
+    # Create index for memory lookups
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_session_chunks_memory_id
+        ON session_chunks(memory_id)
+        """
+    )
+
+    conn.commit()
+
+
+def _get_next_sync_version(conn: sqlite3.Connection) -> int:
+    """Get and increment the global sync version counter."""
+    row = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = 'global_version'"
+    ).fetchone()
+    current = int(row[0]) if row else 0
+    new_version = current + 1
+    conn.execute(
+        "UPDATE sync_metadata SET value = ? WHERE key = 'global_version'",
+        (str(new_version),),
+    )
+    return new_version
+
+
+def _validate_tier(tier: Optional[str]) -> str:
+    """Validate and return tier value. Returns DEFAULT_TIER if None."""
+    if tier is None:
+        return DEFAULT_TIER
+    if tier not in VALID_TIERS:
+        raise ValueError(
+            f"Invalid tier '{tier}'. Must be one of: {', '.join(sorted(VALID_TIERS))}"
+        )
+    return tier
+
+
+def _normalize_expires_at(expires_at: Optional[str]) -> Optional[str]:
+    """Normalize expires_at to canonical ISO format (YYYY-MM-DDTHH:MM:SS).
+
+    Handles common variations like space-separated timestamps.
+    Returns None if input is None or empty.
+    """
+    if not expires_at:
+        return None
+
+    # Already in correct format
+    if "T" in expires_at:
+        return expires_at
+
+    # Convert space-separated to T-separated (e.g., "2026-01-28 12:00:00" -> "2026-01-28T12:00:00")
+    if " " in expires_at:
+        parts = expires_at.split(" ", 1)
+        if len(parts) == 2:
+            return f"{parts[0]}T{parts[1]}"
+
+    # Return as-is if we can't parse it (will be compared as string)
+    return expires_at
+
+
 def _build_metadata_dict(metadata: Mapping[str, Any]) -> Dict[str, Any]:
     """Return metadata in a canonical form with optional hierarchy path."""
 
@@ -426,7 +989,9 @@ def _build_metadata_dict(metadata: Mapping[str, Any]) -> Dict[str, Any]:
                         collected.append(hierarchy[key])
                 if collected:
                     path_source = collected
-        elif isinstance(hierarchy, Sequence) and not isinstance(hierarchy, (str, bytes)):
+        elif isinstance(hierarchy, Sequence) and not isinstance(
+            hierarchy, (str, bytes)
+        ):
             path_source = hierarchy
         else:
             raise ValueError("metadata['hierarchy'] must be a mapping or sequence")
@@ -452,7 +1017,9 @@ def _build_metadata_dict(metadata: Mapping[str, Any]) -> Dict[str, Any]:
         normalised["tasks"] = _normalise_tasks(tasks_value)
 
     if done_present:
-        normalised["done"] = _coerce_bool(done_value) if done_value is not None else False
+        normalised["done"] = (
+            _coerce_bool(done_value) if done_value is not None else False
+        )
 
     if path:
         normalised["hierarchy"] = {"path": path}
@@ -501,7 +1068,9 @@ def _normalise_tasks(tasks: Any) -> List[Dict[str, Any]]:
                 raise ValueError(f"Task at index {index} must include a 'title'")
             title = str(item["title"]).strip()
             if not title:
-                raise ValueError(f"Task at index {index} must provide a non-empty title")
+                raise ValueError(
+                    f"Task at index {index} must provide a non-empty title"
+                )
             task_entry: Dict[str, Any] = {"title": title}
             if "done" in item and item["done"] is not None:
                 try:
@@ -519,7 +1088,9 @@ def _normalise_tasks(tasks: Any) -> List[Dict[str, Any]]:
         elif isinstance(item, str):
             title = item.strip()
             if not title:
-                raise ValueError(f"Task at index {index} must provide a non-empty title")
+                raise ValueError(
+                    f"Task at index {index} must provide a non-empty title"
+                )
             task_entry = {"title": title, "done": False}
         else:
             raise ValueError(
@@ -554,11 +1125,15 @@ def _process_image_for_storage(
     image_storage = get_image_storage_instance()
 
     # Already an R2 reference or HTTP(S) URL - return as-is
-    if src.startswith('r2://') or src.startswith('http://') or src.startswith('https://'):
+    if (
+        src.startswith("r2://")
+        or src.startswith("http://")
+        or src.startswith("https://")
+    ):
         return src
 
     # Handle existing data URI - upload to R2 if configured
-    if src.startswith('data:'):
+    if src.startswith("data:"):
         if image_storage and memory_id is not None:
             try:
                 image_bytes, content_type = parse_data_uri(src)
@@ -571,12 +1146,15 @@ def _process_image_for_storage(
             except Exception as e:
                 # If R2 upload fails, keep the data URI
                 import logging
-                logging.getLogger(__name__).warning(f"Failed to upload data URI to R2: {e}")
+
+                logging.getLogger(__name__).warning(
+                    f"Failed to upload data URI to R2: {e}"
+                )
                 return src
         return src
 
     # Handle file:// URIs
-    if src.startswith('file://'):
+    if src.startswith("file://"):
         file_path = src[7:]  # Remove file:// prefix
     else:
         file_path = src
@@ -591,7 +1169,7 @@ def _process_image_for_storage(
         img = Image.open(path)
 
         # Convert RGBA to RGB if saving as JPEG (no alpha support)
-        has_alpha = img.mode in ('RGBA', 'LA', 'P')
+        has_alpha = img.mode in ("RGBA", "LA", "P")
 
         # Resize if larger than max_size
         width, height = img.size
@@ -609,14 +1187,14 @@ def _process_image_for_storage(
         buffer = io.BytesIO()
         if has_alpha:
             # Keep PNG for images with transparency
-            img.save(buffer, format='PNG', optimize=True)
-            mime_type = 'image/png'
+            img.save(buffer, format="PNG", optimize=True)
+            mime_type = "image/png"
         else:
             # Convert to RGB and save as JPEG for smaller size
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            img.save(buffer, format='JPEG', quality=quality, optimize=True)
-            mime_type = 'image/jpeg'
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(buffer, format="JPEG", quality=quality, optimize=True)
+            mime_type = "image/jpeg"
 
         image_bytes = buffer.getvalue()
 
@@ -631,19 +1209,22 @@ def _process_image_for_storage(
                 )
             except Exception as e:
                 import logging
-                logging.getLogger(__name__).warning(f"Failed to upload image to R2: {e}")
+
+                logging.getLogger(__name__).warning(
+                    f"Failed to upload image to R2: {e}"
+                )
                 # Fall through to base64 encoding
 
         # Fallback: encode as base64 data URI
-        b64 = base64.b64encode(image_bytes).decode('ascii')
-        return f'data:{mime_type};base64,{b64}'
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        return f"data:{mime_type};base64,{b64}"
 
     except Exception:
         # Fallback: read raw file if Pillow fails
         mime_type, _ = mimetypes.guess_type(str(path))
-        if mime_type is None or not mime_type.startswith('image/'):
-            mime_type = 'image/png'
-        with open(path, 'rb') as f:
+        if mime_type is None or not mime_type.startswith("image/"):
+            mime_type = "image/png"
+        with open(path, "rb") as f:
             raw_bytes = f.read()
 
         # Try R2 upload for raw file
@@ -658,8 +1239,8 @@ def _process_image_for_storage(
             except Exception:
                 pass  # Fall through to base64
 
-        b64 = base64.b64encode(raw_bytes).decode('ascii')
-        return f'data:{mime_type};base64,{b64}'
+        b64 = base64.b64encode(raw_bytes).decode("ascii")
+        return f"data:{mime_type};base64,{b64}"
 
 
 def _process_metadata_images(
@@ -675,19 +1256,19 @@ def _process_metadata_images(
     Returns:
         Metadata dict with processed image sources
     """
-    if 'images' not in metadata:
+    if "images" not in metadata:
         return metadata
 
-    images = metadata.get('images')
+    images = metadata.get("images")
     if not isinstance(images, list):
         return metadata
 
     processed_images = []
     for idx, img in enumerate(images):
-        if isinstance(img, dict) and 'src' in img:
+        if isinstance(img, dict) and "src" in img:
             processed_img = dict(img)
-            processed_img['src'] = _process_image_for_storage(
-                img['src'],
+            processed_img["src"] = _process_image_for_storage(
+                img["src"],
                 memory_id=memory_id,
                 image_index=idx,
             )
@@ -696,7 +1277,7 @@ def _process_metadata_images(
             processed_images.append(img)
 
     result = dict(metadata)
-    result['images'] = processed_images
+    result["images"] = processed_images
     return result
 
 
@@ -723,10 +1304,10 @@ def _prepare_metadata(
 
 def _expand_image_urls(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """Expand r2:// image references to full URLs."""
-    if 'images' not in metadata:
+    if "images" not in metadata:
         return metadata
 
-    images = metadata.get('images')
+    images = metadata.get("images")
     if not isinstance(images, list):
         return metadata
 
@@ -734,15 +1315,15 @@ def _expand_image_urls(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
     expanded_images = []
     for img in images:
-        if isinstance(img, dict) and 'src' in img:
+        if isinstance(img, dict) and "src" in img:
             expanded_img = dict(img)
-            expanded_img['src'] = expand_r2_url(img['src'])
+            expanded_img["src"] = expand_r2_url(img["src"])
             expanded_images.append(expanded_img)
         else:
             expanded_images.append(img)
 
     result = dict(metadata)
-    result['images'] = expanded_images
+    result["images"] = expanded_images
     return result
 
 
@@ -753,7 +1334,7 @@ def _present_metadata(metadata: Optional[Any]) -> Optional[Any]:
         try:
             result = _build_metadata_dict(metadata)
             # Expand r2:// image URLs to full URLs
-            if result and 'images' in result:
+            if result and "images" in result:
                 result = _expand_image_urls(result)
             return result
         except ValueError:
@@ -762,7 +1343,9 @@ def _present_metadata(metadata: Optional[Any]) -> Optional[Any]:
     return metadata
 
 
-def _metadata_matches_filters(metadata: Optional[Any], filters: Mapping[str, Any]) -> bool:
+def _metadata_matches_filters(
+    metadata: Optional[Any], filters: Mapping[str, Any]
+) -> bool:
     if not filters:
         return True
 
@@ -778,7 +1361,9 @@ def _metadata_matches_filters(metadata: Optional[Any], filters: Mapping[str, Any
     hierarchy_path: List[str] = []
     if isinstance(hierarchy_entry, Mapping):
         path_value = hierarchy_entry.get("path")
-        if isinstance(path_value, Sequence) and not isinstance(path_value, (str, bytes)):
+        if isinstance(path_value, Sequence) and not isinstance(
+            path_value, (str, bytes)
+        ):
             hierarchy_path = [str(part) for part in path_value]
 
     for key, expected in filters.items():
@@ -792,7 +1377,9 @@ def _metadata_matches_filters(metadata: Optional[Any], filters: Mapping[str, Any
             if isinstance(expected, str):
                 if expected not in hierarchy_path:
                     return False
-            elif isinstance(expected, Sequence) and not isinstance(expected, (str, bytes)):
+            elif isinstance(expected, Sequence) and not isinstance(
+                expected, (str, bytes)
+            ):
                 expected_list = [str(part) for part in expected]
                 if hierarchy_path[: len(expected_list)] != expected_list:
                     return False
@@ -805,7 +1392,9 @@ def _metadata_matches_filters(metadata: Optional[Any], filters: Mapping[str, Any
     return True
 
 
-def _validate_metadata_filters(metadata_filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _validate_metadata_filters(
+    metadata_filters: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
     if metadata_filters is None:
         return {}
     if not isinstance(metadata_filters, Mapping):
@@ -858,7 +1447,7 @@ def _fts_delete(conn: sqlite3.Connection, memory_id: int) -> None:
 def _serialise_row(row: sqlite3.Row) -> Dict[str, Any]:
     metadata = row["metadata"]
     tags = row["tags"]
-    row_keys = row.keys() if hasattr(row, 'keys') else []
+    row_keys = row.keys() if hasattr(row, "keys") else []
     result = {
         "id": row["id"],
         "content": row["content"],
@@ -868,13 +1457,36 @@ def _serialise_row(row: sqlite3.Row) -> Dict[str, Any]:
         "updated_at": row["updated_at"] if "updated_at" in row_keys else None,
     }
 
+    # Add tier fields if available (may not exist in older schemas during migration)
+    if "tier" in row_keys:
+        result["tier"] = row["tier"] if row["tier"] is not None else DEFAULT_TIER
+    else:
+        result["tier"] = DEFAULT_TIER
+
+    if "expires_at" in row_keys:
+        result["expires_at"] = row["expires_at"]
+
+    # Add workspace field if available
+    if "workspace" in row_keys:
+        result["workspace"] = (
+            row["workspace"] if row["workspace"] is not None else DEFAULT_WORKSPACE
+        )
+    else:
+        result["workspace"] = DEFAULT_WORKSPACE
+
     # Add importance fields if available (may not exist in older schemas during migration)
     if "importance" in row_keys:
         base_importance = row["importance"] if row["importance"] is not None else 1.0
-        access_count = row["access_count"] if "access_count" in row_keys and row["access_count"] is not None else 0
+        access_count = (
+            row["access_count"]
+            if "access_count" in row_keys and row["access_count"] is not None
+            else 0
+        )
         result["importance"] = base_importance
         result["access_count"] = access_count
-        result["last_accessed"] = row["last_accessed"] if "last_accessed" in row_keys else None
+        result["last_accessed"] = (
+            row["last_accessed"] if "last_accessed" in row_keys else None
+        )
         # Calculate current importance score with decay
         result["importance_score"] = calculate_importance(
             row["created_at"],
@@ -905,13 +1517,13 @@ def _enforce_tag_whitelist(tags: List[str]) -> None:
     if not TAG_WHITELIST:
         return
 
-    explicit = {tag for tag in TAG_WHITELIST if not tag.endswith('.*')}
-    wildcards = [tag[:-2] for tag in TAG_WHITELIST if tag.endswith('.*')]
+    explicit = {tag for tag in TAG_WHITELIST if not tag.endswith(".*")}
+    wildcards = [tag[:-2] for tag in TAG_WHITELIST if tag.endswith(".*")]
 
     for tag in tags:
         if tag in explicit:
             continue
-        if any(tag == prefix or tag.startswith(prefix + '.') for prefix in wildcards):
+        if any(tag == prefix or tag.startswith(prefix + ".") for prefix in wildcards):
             continue
         raise ValueError(f"Tag '{tag}' is not in the allowed tag list")
 
@@ -962,9 +1574,12 @@ def _compute_embedding_sentence_transformers(text: str) -> Dict[str, float]:
     try:
         if "sentence_transformers" not in _embedding_model_cache:
             from sentence_transformers import SentenceTransformer
+
             # Use a small, fast model by default
             model_name = os.getenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
-            _embedding_model_cache["sentence_transformers"] = SentenceTransformer(model_name)
+            _embedding_model_cache["sentence_transformers"] = SentenceTransformer(
+                model_name
+            )
 
         model = _embedding_model_cache["sentence_transformers"]
         embedding = model.encode(text, convert_to_numpy=True)
@@ -1014,25 +1629,187 @@ def _compute_embedding_openai(text: str) -> Dict[str, float]:
         return _compute_embedding_tfidf(text)
 
 
+# ---------------------------------------------------------------------------
+# Embedding cache functions
+# ---------------------------------------------------------------------------
+
+# Track cache statistics in memory
+_embedding_cache_stats = {"hits": 0, "misses": 0}
+
+
+def _compute_content_hash(text: str) -> str:
+    """Compute SHA-256 hash of text for cache key."""
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _get_cached_embedding(
+    conn: sqlite3.Connection,
+    content_hash: str,
+    model: str,
+) -> Optional[Dict[str, float]]:
+    """Get embedding from cache if exists and model matches."""
+    if not EMBEDDING_CACHE_ENABLED:
+        return None
+
+    row = conn.execute(
+        """
+        SELECT embedding FROM embedding_cache
+        WHERE content_hash = ? AND model = ?
+        """,
+        (content_hash, model),
+    ).fetchone()
+
+    if row:
+        # Update access stats
+        conn.execute(
+            """
+            UPDATE embedding_cache
+            SET last_accessed = datetime('now'), access_count = access_count + 1
+            WHERE content_hash = ?
+            """,
+            (content_hash,),
+        )
+        _embedding_cache_stats["hits"] += 1
+        return _json_to_embedding(row["embedding"])
+
+    _embedding_cache_stats["misses"] += 1
+    return None
+
+
+def _store_cached_embedding(
+    conn: sqlite3.Connection,
+    content_hash: str,
+    embedding: Dict[str, float],
+    model: str,
+) -> None:
+    """Store embedding in cache."""
+    if not EMBEDDING_CACHE_ENABLED:
+        return
+
+    embedding_json = _embedding_to_json(embedding)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO embedding_cache (content_hash, embedding, model)
+        VALUES (?, ?, ?)
+        """,
+        (content_hash, embedding_json, model),
+    )
+
+    # Check if we need to evict old entries
+    _enforce_cache_limit(conn)
+
+
+def _enforce_cache_limit(conn: sqlite3.Connection) -> int:
+    """Remove oldest entries if cache exceeds limit. Returns count of deleted entries."""
+    if not EMBEDDING_CACHE_ENABLED or EMBEDDING_CACHE_MAX_ENTRIES <= 0:
+        return 0
+
+    count = conn.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0]
+    if count <= EMBEDDING_CACHE_MAX_ENTRIES:
+        return 0
+
+    # Delete oldest 10% of entries
+    delete_count = max(1, int(count * 0.1))
+    conn.execute(
+        """
+        DELETE FROM embedding_cache
+        WHERE content_hash IN (
+            SELECT content_hash FROM embedding_cache
+            ORDER BY last_accessed ASC
+            LIMIT ?
+        )
+        """,
+        (delete_count,),
+    )
+    return delete_count
+
+
+def get_embedding_cache_stats(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Get embedding cache statistics."""
+    total_entries = conn.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0]
+
+    # Get oldest and newest entries
+    oldest = conn.execute("SELECT MIN(last_accessed) FROM embedding_cache").fetchone()[
+        0
+    ]
+    newest = conn.execute("SELECT MAX(last_accessed) FROM embedding_cache").fetchone()[
+        0
+    ]
+
+    # Calculate hit rate
+    total_requests = _embedding_cache_stats["hits"] + _embedding_cache_stats["misses"]
+    hit_rate = (
+        _embedding_cache_stats["hits"] / total_requests if total_requests > 0 else 0.0
+    )
+
+    return {
+        "enabled": EMBEDDING_CACHE_ENABLED,
+        "max_entries": EMBEDDING_CACHE_MAX_ENTRIES,
+        "total_entries": total_entries,
+        "cache_hits": _embedding_cache_stats["hits"],
+        "cache_misses": _embedding_cache_stats["misses"],
+        "hit_rate": round(hit_rate, 3),
+        "oldest_entry": oldest,
+        "newest_entry": newest,
+    }
+
+
+def clear_embedding_cache(conn: sqlite3.Connection) -> int:
+    """Clear all entries from the embedding cache. Returns count of deleted entries."""
+    count = conn.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0]
+    conn.execute("DELETE FROM embedding_cache")
+    conn.commit()
+    # Reset stats
+    _embedding_cache_stats["hits"] = 0
+    _embedding_cache_stats["misses"] = 0
+    return count
+
+
 def _compute_embedding(
     content: str,
     metadata: Optional[Dict[str, Any]],
     tags: List[str],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Dict[str, float]:
-    """Compute embedding using configured backend."""
+    """Compute embedding using configured backend with caching.
+
+    Args:
+        content: Memory content
+        metadata: Memory metadata
+        tags: Memory tags
+        conn: Optional database connection for cache lookup/storage
+    """
     text = _get_embedding_text(content, metadata, tags)
 
+    # Try cache first if connection provided and cache enabled
+    if conn is not None and EMBEDDING_CACHE_ENABLED:
+        content_hash = _compute_content_hash(text)
+        cached = _get_cached_embedding(conn, content_hash, EMBEDDING_MODEL)
+        if cached is not None:
+            return cached
+
+    # Compute embedding
     if EMBEDDING_MODEL == "sentence-transformers":
-        return _compute_embedding_sentence_transformers(text)
+        embedding = _compute_embedding_sentence_transformers(text)
     elif EMBEDDING_MODEL == "openai":
-        return _compute_embedding_openai(text)
+        embedding = _compute_embedding_openai(text)
     else:  # Default to tfidf
-        return _compute_embedding_tfidf(text)
+        embedding = _compute_embedding_tfidf(text)
+
+    # Store in cache if connection provided
+    if conn is not None and EMBEDDING_CACHE_ENABLED and embedding:
+        content_hash = _compute_content_hash(text)
+        _store_cached_embedding(conn, content_hash, embedding, EMBEDDING_MODEL)
+
+    return embedding
 
 
 # ---------------------------------------------------------------------------
 # LLM-based memory comparison for deduplication
 # ---------------------------------------------------------------------------
+
 
 def _get_llm_client():
     """Get or create cached LLM client for comparison."""
@@ -1086,11 +1863,11 @@ def compare_memories_llm(
 
 Memory A:
 {content_a}
-{f'Metadata: {json.dumps(metadata_a)}' if metadata_a else ''}
+{f"Metadata: {json.dumps(metadata_a)}" if metadata_a else ""}
 
 Memory B:
 {content_b}
-{f'Metadata: {json.dumps(metadata_b)}' if metadata_b else ''}
+{f"Metadata: {json.dumps(metadata_b)}" if metadata_b else ""}
 
 Analyze whether these memories contain the same information (duplicates), related but distinct information (similar), or unrelated information (different).
 
@@ -1106,8 +1883,11 @@ Respond with JSON only (no markdown):
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that compares text entries for semantic similarity. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that compares text entries for semantic similarity. Always respond with valid JSON only.",
+                },
+                {"role": "user", "content": prompt},
             ],
             temperature=0.1,
             max_tokens=300,
@@ -1187,11 +1967,13 @@ def find_duplicate_candidates(
                 pair_key = tuple(sorted([memory_id, related_id]))
                 if pair_key not in pairs_seen:
                     pairs_seen.add(pair_key)
-                    candidates.append({
-                        "memory_a_id": pair_key[0],
-                        "memory_b_id": pair_key[1],
-                        "similarity_score": score,
-                    })
+                    candidates.append(
+                        {
+                            "memory_a_id": pair_key[0],
+                            "memory_b_id": pair_key[1],
+                            "similarity_score": score,
+                        }
+                    )
 
     # Sort by similarity (highest first)
     candidates.sort(key=lambda x: x["similarity_score"], reverse=True)
@@ -1298,6 +2080,7 @@ def _search_by_vector(
                 record["content"],
                 record.get("metadata"),
                 record.get("tags", []),
+                conn,
             )
             _upsert_embedding(conn, memory_id, vector)
         score = _cosine_similarity(vector_query, vector)
@@ -1307,7 +2090,7 @@ def _search_by_vector(
 
     results.sort(key=lambda entry: entry["score"], reverse=True)
     if top_k is not None:
-        results = results[: top_k]
+        results = results[:top_k]
     return results
 
 
@@ -1365,6 +2148,7 @@ def _update_crossrefs_for_memory(
                 record["content"],
                 record.get("metadata"),
                 record.get("tags", []),
+                conn,
             )
             _upsert_embedding(conn, memory_id, vector)
 
@@ -1386,7 +2170,14 @@ def _update_crossrefs_for_memory(
 
 
 # Valid edge types for explicit links
-EDGE_TYPES = {"related_to", "supersedes", "contradicts", "implements", "extends", "references"}
+EDGE_TYPES = {
+    "related_to",
+    "supersedes",
+    "contradicts",
+    "implements",
+    "extends",
+    "references",
+}
 
 
 def add_link(
@@ -1408,7 +2199,9 @@ def add_link(
         Dict with status and created links
     """
     if edge_type not in EDGE_TYPES:
-        raise ValueError(f"Invalid edge_type '{edge_type}'. Must be one of: {', '.join(sorted(EDGE_TYPES))}")
+        raise ValueError(
+            f"Invalid edge_type '{edge_type}'. Must be one of: {', '.join(sorted(EDGE_TYPES))}"
+        )
 
     # Verify both memories exist
     from_mem = get_memory(conn, from_id)
@@ -1434,7 +2227,9 @@ def add_link(
         reverse_type = _get_reverse_edge_type(edge_type)
         existing_reverse = get_crossrefs(conn, to_id)
         existing_reverse = [r for r in existing_reverse if r.get("id") != from_id]
-        existing_reverse.append({"id": from_id, "score": 1.0, "edge_type": reverse_type})
+        existing_reverse.append(
+            {"id": from_id, "score": 1.0, "edge_type": reverse_type}
+        )
         _store_crossrefs(conn, to_id, existing_reverse)
         links_created.append({"from": to_id, "to": from_id, "edge_type": reverse_type})
 
@@ -1449,7 +2244,7 @@ def _get_reverse_edge_type(edge_type: str) -> str:
         "supersedes": "superseded_by",
         "extends": "extended_by",
         "contradicts": "contradicts",  # symmetric
-        "related_to": "related_to",    # symmetric
+        "related_to": "related_to",  # symmetric
     }
     return reverse_map.get(edge_type, "related_to")
 
@@ -1546,15 +2341,19 @@ def detect_clusters(
         for tags in all_tags:
             for tag in tags:
                 tag_counts[tag] = tag_counts.get(tag, 0) + 1
-        top_tags = sorted(tag_counts.keys(), key=lambda t: tag_counts[t], reverse=True)[:5]
+        top_tags = sorted(tag_counts.keys(), key=lambda t: tag_counts[t], reverse=True)[
+            :5
+        ]
 
-        result.append({
-            "cluster_id": i + 1,
-            "size": len(cluster_ids),
-            "memory_ids": sorted(cluster_ids),
-            "common_tags": list(common_tags),
-            "top_tags": top_tags,
-        })
+        result.append(
+            {
+                "cluster_id": i + 1,
+                "size": len(cluster_ids),
+                "memory_ids": sorted(cluster_ids),
+                "common_tags": list(common_tags),
+                "top_tags": top_tags,
+            }
+        )
 
     # Sort by size descending
     result.sort(key=lambda c: c["size"], reverse=True)
@@ -1611,9 +2410,17 @@ def add_memory(
     content: str,
     metadata: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,
+    tier: Optional[str] = None,
+    expires_at: Optional[str] = None,
+    workspace: Optional[str] = None,
 ) -> Dict[str, Any]:
     # Validate and normalize content (trim, length check)
     content = _validate_content(content)
+
+    # Validate tier and normalize expires_at
+    validated_tier = _validate_tier(tier)
+    expires_at = _normalize_expires_at(expires_at)
+    workspace = workspace or DEFAULT_WORKSPACE
 
     # Auto-detect memory type (issue/todo) from content if not explicitly set
     metadata, tags = _apply_auto_detection(content, metadata, tags)
@@ -1629,22 +2436,38 @@ def add_memory(
     # Check if metadata has images that need processing
     has_images = (
         metadata is not None
-        and isinstance(metadata.get('images'), list)
-        and len(metadata.get('images', [])) > 0
+        and isinstance(metadata.get("images"), list)
+        and len(metadata.get("images", [])) > 0
     )
+
+    # Get sync version for this change
+    sync_version = _get_next_sync_version(conn)
 
     if has_images:
         # First pass: insert without processed images to get memory_id
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         cur = conn.execute(
-            "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
-            (content, None, tags_json, now),
+            "INSERT INTO memories (content, metadata, tags, created_at, tier, expires_at, sync_version, workspace) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                content,
+                None,
+                tags_json,
+                now,
+                validated_tier,
+                expires_at,
+                sync_version,
+                workspace,
+            ),
         )
         memory_id = cur.lastrowid
 
         # Second pass: process metadata with memory_id (uploads images to R2)
         prepared_metadata = _prepare_metadata(metadata, memory_id=memory_id)
-        metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
+        metadata_json = (
+            json.dumps(prepared_metadata, ensure_ascii=False)
+            if prepared_metadata
+            else None
+        )
 
         # Update the record with processed metadata
         conn.execute(
@@ -1654,16 +2477,29 @@ def add_memory(
     else:
         # No images - single pass
         prepared_metadata = _prepare_metadata(metadata)
-        metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        metadata_json = (
+            json.dumps(prepared_metadata, ensure_ascii=False)
+            if prepared_metadata
+            else None
+        )
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         cur = conn.execute(
-            "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
-            (content, metadata_json, tags_json, now),
+            "INSERT INTO memories (content, metadata, tags, created_at, tier, expires_at, sync_version, workspace) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                content,
+                metadata_json,
+                tags_json,
+                now,
+                validated_tier,
+                expires_at,
+                sync_version,
+                workspace,
+            ),
         )
         memory_id = cur.lastrowid
 
     _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
-    vector = _compute_embedding(content, prepared_metadata, validated_tags)
+    vector = _compute_embedding(content, prepared_metadata, validated_tags, conn)
     _upsert_embedding(conn, memory_id, vector)
     _update_crossrefs(conn, memory_id)
     conn.commit()
@@ -1677,7 +2513,9 @@ def add_memories(
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     embeddings: List[Dict[str, float]] = []
-    prepared: List[tuple[str, Optional[str], Optional[str]]] = []
+    prepared: List[
+        tuple[str, Optional[str], Optional[str], str, Optional[str], int]
+    ] = []
 
     for entry in entries:
         if "content" not in entry:
@@ -1685,28 +2523,42 @@ def add_memories(
         content = str(entry["content"]).strip()
         metadata = entry.get("metadata")
         tags = entry.get("tags") or []
+        tier = _validate_tier(entry.get("tier"))
+        expires_at = _normalize_expires_at(entry.get("expires_at"))
         # Auto-detect memory type (issue/todo) from content if not explicitly set
         metadata, tags = _apply_auto_detection(content, metadata, tags)
         prepared_metadata = _prepare_metadata(metadata)
         validated_tags = _validate_tags(tags)
         _enforce_tag_whitelist(validated_tags)
-        metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
+        metadata_json = (
+            json.dumps(prepared_metadata, ensure_ascii=False)
+            if prepared_metadata
+            else None
+        )
         tags_json = json.dumps(validated_tags, ensure_ascii=False)
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        prepared.append((content, metadata_json, tags_json, now))
-        rows.append({
-            "content": content,
-            "metadata_json": metadata_json,
-            "tags_json": tags_json,
-            "validated_tags": validated_tags,
-        })
-        embeddings.append(_compute_embedding(content, prepared_metadata, validated_tags))
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # Get sync version for each entry
+        sync_version = _get_next_sync_version(conn)
+        prepared.append(
+            (content, metadata_json, tags_json, now, tier, expires_at, sync_version)
+        )
+        rows.append(
+            {
+                "content": content,
+                "metadata_json": metadata_json,
+                "tags_json": tags_json,
+                "validated_tags": validated_tags,
+            }
+        )
+        embeddings.append(
+            _compute_embedding(content, prepared_metadata, validated_tags, conn)
+        )
 
     if not prepared:
         return []
 
     cur = conn.executemany(
-        "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO memories (content, metadata, tags, created_at, tier, expires_at, sync_version) VALUES (?, ?, ?, ?, ?, ?, ?)",
         prepared,
     )
 
@@ -1715,7 +2567,13 @@ def add_memories(
     inserted: List[int] = list(range(start_id - len(prepared) + 1, start_id + 1))
 
     for memory_id, entry, vector in zip(inserted, rows, embeddings):
-        _fts_upsert(conn, memory_id, entry["content"], entry["metadata_json"], entry["tags_json"])
+        _fts_upsert(
+            conn,
+            memory_id,
+            entry["content"],
+            entry["metadata_json"],
+            entry["tags_json"],
+        )
         _upsert_embedding(conn, memory_id, vector)
         _update_crossrefs(conn, memory_id)
 
@@ -1745,7 +2603,7 @@ def get_memory(
     """
     row = conn.execute(
         """SELECT id, content, metadata, tags, created_at, updated_at,
-                  importance, last_accessed, access_count
+                  importance, last_accessed, access_count, tier, expires_at, workspace
            FROM memories WHERE id = ?""",
         (memory_id,),
     ).fetchone()
@@ -1768,6 +2626,8 @@ def update_memory(
     content: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,
+    tier: Optional[str] = None,
+    expires_at: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Update an existing memory. Only provided fields are updated."""
     # First check if memory exists
@@ -1777,8 +2637,20 @@ def update_memory(
 
     # Determine what to update
     new_content = content.strip() if content is not None else existing["content"]
-    new_metadata = _prepare_metadata(metadata) if metadata is not None else existing.get("metadata")
+    new_metadata = (
+        _prepare_metadata(metadata)
+        if metadata is not None
+        else existing.get("metadata")
+    )
     new_tags = _validate_tags(tags) if tags is not None else existing.get("tags", [])
+    new_tier = (
+        _validate_tier(tier) if tier is not None else existing.get("tier", DEFAULT_TIER)
+    )
+    new_expires_at = (
+        _normalize_expires_at(expires_at)
+        if expires_at is not None
+        else existing.get("expires_at")
+    )
 
     if tags is not None:
         _enforce_tag_whitelist(new_tags)
@@ -1787,18 +2659,32 @@ def update_memory(
     content_changed = content is not None and new_content != existing["content"]
 
     # Serialize for storage
-    metadata_json = json.dumps(new_metadata, ensure_ascii=False) if new_metadata else None
+    metadata_json = (
+        json.dumps(new_metadata, ensure_ascii=False) if new_metadata else None
+    )
     tags_json = json.dumps(new_tags, ensure_ascii=False)
 
+    # Get new sync version for this update
+    sync_version = _get_next_sync_version(conn)
+
     # Update the memory
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     cur = conn.execute(
-        "UPDATE memories SET content = ?, metadata = ?, tags = ?, updated_at = ? WHERE id = ?",
-        (new_content, metadata_json, tags_json, now, memory_id),
+        "UPDATE memories SET content = ?, metadata = ?, tags = ?, tier = ?, expires_at = ?, sync_version = ?, updated_at = ? WHERE id = ?",
+        (
+            new_content,
+            metadata_json,
+            tags_json,
+            new_tier,
+            new_expires_at,
+            sync_version,
+            now,
+            memory_id,
+        ),
     )
 
     # Verify the update affected a row (helps catch D1 issues)
-    if hasattr(cur, 'rowcount') and cur.rowcount == 0:
+    if hasattr(cur, "rowcount") and cur.rowcount == 0:
         # Row wasn't updated - this shouldn't happen since we checked existence
         raise RuntimeError(f"UPDATE affected 0 rows for memory {memory_id}")
 
@@ -1809,7 +2695,7 @@ def update_memory(
         _fts_upsert(conn, memory_id, new_content, metadata_json, tags_json)
 
         # Update embeddings (calls OpenAI API - ~1-2 sec)
-        vector = _compute_embedding(new_content, new_metadata, new_tags)
+        vector = _compute_embedding(new_content, new_metadata, new_tags, conn)
         _upsert_embedding(conn, memory_id, vector)
 
         # Skip cross-references update - too expensive for D1 HTTP API (~15 sec)
@@ -1845,9 +2731,19 @@ def update_memory(
 
 
 def delete_memory(conn: sqlite3.Connection, memory_id: int) -> bool:
+    # Get content preview before deletion for sync tracking
+    row = conn.execute(
+        "SELECT content FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    if not row:
+        return False
+
+    content_preview = row[0][:100] if row[0] else None
+
     # Clean up R2 images before deleting memory
-    from .image_storage import get_image_storage_instance
     import logging
+
+    from .image_storage import get_image_storage_instance
 
     image_storage = get_image_storage_instance()
     if image_storage:
@@ -1861,6 +2757,13 @@ def delete_memory(conn: sqlite3.Connection, memory_id: int) -> bool:
             logging.getLogger(__name__).warning(
                 f"Failed to delete R2 images for memory {memory_id}: {e}"
             )
+
+    # Track deletion for sync
+    sync_version = _get_next_sync_version(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO deleted_memories (memory_id, content_preview, sync_version) VALUES (?, ?, ?)",
+        (memory_id, content_preview, sync_version),
+    )
 
     _fts_delete(conn, memory_id)
     _delete_embedding(conn, memory_id)
@@ -1876,9 +2779,27 @@ def delete_memories(conn: sqlite3.Connection, memory_ids: Iterable[int]) -> int:
     if not ids:
         return 0
 
+    # Get content previews before deletion for sync tracking
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT id, content FROM memories WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+
+    # Track deletions for sync
+    for row in rows:
+        memory_id = row[0]
+        content_preview = row[1][:100] if row[1] else None
+        sync_version = _get_next_sync_version(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO deleted_memories (memory_id, content_preview, sync_version) VALUES (?, ?, ?)",
+            (memory_id, content_preview, sync_version),
+        )
+
     # Clean up R2 images for all memories
-    from .image_storage import get_image_storage_instance
     import logging
+
+    from .image_storage import get_image_storage_instance
 
     image_storage = get_image_storage_instance()
     if image_storage:
@@ -1896,7 +2817,7 @@ def delete_memories(conn: sqlite3.Connection, memory_ids: Iterable[int]) -> int:
         _clear_crossrefs(conn, memory_id)
         _remove_memory_from_crossrefs(conn, memory_id)
     conn.execute(
-        f"DELETE FROM memories WHERE id IN ({','.join('?' for _ in ids)})",
+        f"DELETE FROM memories WHERE id IN ({placeholders})",
         ids,
     )
     conn.commit()
@@ -1910,28 +2831,28 @@ def _parse_date_filter(date_str: str) -> str:
 
     # Try ISO format first
     try:
-        parsed = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-        return parsed.strftime('%Y-%m-%d %H:%M:%S')
+        parsed = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         pass
 
     # Try relative formats: 7d, 1m, 1y, etc.
-    match = re.match(r'^(\d+)([dmyDMY])$', date_str.strip())
+    match = re.match(r"^(\d+)([dmyDMY])$", date_str.strip())
     if match:
         value = int(match.group(1))
         unit = match.group(2).lower()
 
-        now = datetime.utcnow()
-        if unit == 'd':
+        now = datetime.now(timezone.utc)
+        if unit == "d":
             target = now - timedelta(days=value)
-        elif unit == 'm':
+        elif unit == "m":
             target = now - timedelta(days=value * 30)  # Approximate
-        elif unit == 'y':
+        elif unit == "y":
             target = now - timedelta(days=value * 365)  # Approximate
         else:
             raise ValueError(f"Unknown time unit: {unit}")
 
-        return target.strftime('%Y-%m-%d %H:%M:%S')
+        return target.strftime("%Y-%m-%d %H:%M:%S")
 
     raise ValueError(f"Invalid date format: {date_str}")
 
@@ -1948,7 +2869,16 @@ def list_memories(
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
     sort_by_importance: bool = False,
+    workspace: Optional[str] = None,
+    workspaces: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
+    """List memories with optional filtering.
+
+    Args:
+        workspace: Filter to a single workspace (None = all workspaces)
+        workspaces: Filter to multiple workspaces (None = all workspaces)
+                   If both workspace and workspaces are provided, workspace is ignored.
+    """
     validated_filters = _validate_metadata_filters(metadata_filters)
 
     rows: List[sqlite3.Row]
@@ -1981,9 +2911,24 @@ def list_memories(
             limit_clause += " OFFSET ?"
             limit_params.append(offset)
 
-    # Column list including importance fields
-    cols_fts = "m.id, m.content, m.metadata, m.tags, m.created_at, m.updated_at, m.importance, m.last_accessed, m.access_count"
-    cols_plain = "id, content, metadata, tags, created_at, updated_at, importance, last_accessed, access_count"
+    # Column list including importance, tier, and workspace fields
+    cols_fts = "m.id, m.content, m.metadata, m.tags, m.created_at, m.updated_at, m.importance, m.last_accessed, m.access_count, m.tier, m.expires_at, m.workspace"
+    cols_plain = "id, content, metadata, tags, created_at, updated_at, importance, last_accessed, access_count, tier, expires_at, workspace"
+
+    # Build workspace filter
+    workspace_clause_fts = ""
+    workspace_clause_plain = ""
+    workspace_params: List[str] = []
+
+    if workspaces:
+        placeholders = ",".join("?" * len(workspaces))
+        workspace_clause_fts = f" AND COALESCE(m.workspace, ?) IN ({placeholders})"
+        workspace_clause_plain = f" AND COALESCE(workspace, ?) IN ({placeholders})"
+        workspace_params = [DEFAULT_WORKSPACE, *workspaces]
+    elif workspace:
+        workspace_clause_fts = " AND COALESCE(m.workspace, ?) = ?"
+        workspace_clause_plain = " AND COALESCE(workspace, ?) = ?"
+        workspace_params = [DEFAULT_WORKSPACE, workspace]
 
     # Order clause - use importance_score calculation or created_at
     order_fts = "m.created_at DESC"
@@ -1997,10 +2942,10 @@ def list_memories(
                 SELECT {cols_fts}
                 FROM memories m
                 JOIN memories_fts f ON m.id = f.rowid
-                WHERE f MATCH ?{date_clause_fts}
+                WHERE f MATCH ?{date_clause_fts}{workspace_clause_fts}
                 ORDER BY {order_fts}{limit_clause}
                 """,
-                (query, *date_params, *limit_params),
+                (query, *date_params, *workspace_params, *limit_params),
             ).fetchall()
         except sqlite3.OperationalError:
             rows = []
@@ -2010,16 +2955,16 @@ def list_memories(
             f"""
             SELECT {cols_plain}
             FROM memories
-            WHERE (content LIKE ? OR tags LIKE ? OR metadata LIKE ?){date_clause_plain}
+            WHERE (content LIKE ? OR tags LIKE ? OR metadata LIKE ?){date_clause_plain}{workspace_clause_plain}
             ORDER BY {order_plain}{limit_clause}
             """,
-            (pattern, pattern, pattern, *date_params, *limit_params),
+            (pattern, pattern, pattern, *date_params, *workspace_params, *limit_params),
         ).fetchall()
     else:
-        where_clause = " WHERE 1=1" + date_clause_plain if date_clause_plain else ""
+        where_clause = " WHERE 1=1" + date_clause_plain + workspace_clause_plain
         rows = conn.execute(
             f"SELECT {cols_plain} FROM memories{where_clause} ORDER BY {order_plain}{limit_clause}",
-            tuple([*date_params, *limit_params]),
+            tuple([*date_params, *workspace_params, *limit_params]),
         ).fetchall()
 
     # If the FTS search yielded nothing because of an SQLite error (e.g. malformed query)
@@ -2030,16 +2975,18 @@ def list_memories(
             f"""
             SELECT {cols_plain}
             FROM memories
-            WHERE (content LIKE ? OR tags LIKE ? OR metadata LIKE ?){date_clause_plain}
+            WHERE (content LIKE ? OR tags LIKE ? OR metadata LIKE ?){date_clause_plain}{workspace_clause_plain}
             ORDER BY {order_plain}{limit_clause}
             """,
-            (pattern, pattern, pattern, *date_params, *limit_params),
+            (pattern, pattern, pattern, *date_params, *workspace_params, *limit_params),
         ).fetchall()
 
     records: List[Dict[str, Any]] = []
     for row in rows:
         record = _serialise_row(row)
-        if validated_filters and not _metadata_matches_filters(record.get("metadata"), validated_filters):
+        if validated_filters and not _metadata_matches_filters(
+            record.get("metadata"), validated_filters
+        ):
             continue
 
         # Apply tag filters
@@ -2094,8 +3041,8 @@ def find_invalid_tag_entries(
     if not allowed:
         return []
 
-    explicit = {tag for tag in allowed if not tag.endswith('.*')}
-    wildcards = [tag[:-2] for tag in allowed if tag.endswith('.*')]
+    explicit = {tag for tag in allowed if not tag.endswith(".*")}
+    wildcards = [tag[:-2] for tag in allowed if tag.endswith(".*")]
 
     invalid: List[Dict[str, Any]] = []
     rows = conn.execute("SELECT id, tags FROM memories")
@@ -2114,7 +3061,9 @@ def find_invalid_tag_entries(
                 continue
             if tag in explicit:
                 continue
-            if any(tag == prefix or tag.startswith(prefix + '.') for prefix in wildcards):
+            if any(
+                tag == prefix or tag.startswith(prefix + ".") for prefix in wildcards
+            ):
                 continue
             bad.append(tag)
         if bad:
@@ -2147,13 +3096,14 @@ def semantic_search(
     # Check for embedding model mismatch and rebuild if needed
     if auto_rebuild and _check_embedding_model_mismatch(conn):
         import sys
+
         print(
             f"[memora] Embedding model changed: rebuilding embeddings with '{EMBEDDING_MODEL}'...",
             file=sys.stderr,
         )
         rebuild_embeddings(conn)
 
-    vector_query = _compute_embedding(query, None, [])
+    vector_query = _compute_embedding(query, None, [], conn)
     if not vector_query:
         return []
     return _search_by_vector(
@@ -2165,11 +3115,16 @@ def semantic_search(
     )
 
 
+# Valid fusion methods for hybrid search
+FUSION_METHODS = {"rrf", "weighted"}
+
+
 def hybrid_search(
     conn: sqlite3.Connection,
     query: str,
     *,
     semantic_weight: float = 0.6,
+    fusion_method: str = "rrf",
     top_k: int = 10,
     min_score: float = 0.0,
     metadata_filters: Optional[Dict[str, Any]] = None,
@@ -2180,12 +3135,15 @@ def hybrid_search(
     tags_none: Optional[List[str]] = None,
     auto_rebuild: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Combine FTS keyword search and semantic vector search using Reciprocal Rank Fusion.
+    """Combine FTS keyword search and semantic vector search.
 
     Args:
         conn: Database connection
         query: Search query text
         semantic_weight: Weight for semantic results (0-1). Keyword weight = 1 - semantic_weight.
+        fusion_method: How to combine results:
+            - "rrf": Reciprocal Rank Fusion (position-based, default)
+            - "weighted": Direct score weighting (semantic_weight * vector_score + keyword_weight * text_score)
         top_k: Maximum number of results to return
         min_score: Minimum combined score threshold
         metadata_filters: Optional metadata filters
@@ -2201,6 +3159,12 @@ def hybrid_search(
     """
     if not query or not query.strip():
         return []
+
+    # Validate fusion method
+    if fusion_method not in FUSION_METHODS:
+        raise ValueError(
+            f"Invalid fusion_method '{fusion_method}'. Must be one of: {', '.join(sorted(FUSION_METHODS))}"
+        )
 
     # Clamp semantic_weight to valid range
     semantic_weight = max(0.0, min(1.0, semantic_weight))
@@ -2230,29 +3194,66 @@ def hybrid_search(
         tags_none=tags_none,
     )
 
-    # 3. Apply Reciprocal Rank Fusion (RRF)
-    # RRF score = sum(1 / (k + rank)) where k is a constant (typically 60)
-    rrf_k = 60
     scores: Dict[int, float] = {}
     memories_by_id: Dict[int, Dict[str, Any]] = {}
 
-    # Score semantic results
-    for rank, result in enumerate(semantic_results):
-        memory = result.get("memory", result)
-        memory_id = memory["id"]
-        memories_by_id[memory_id] = memory
-        semantic_score = result.get("score", 0.0)
-        # Combine RRF with original semantic score for better ranking
-        rrf_contribution = semantic_weight / (rrf_k + rank)
-        score_boost = semantic_weight * semantic_score * 0.1  # Small boost from actual similarity
-        scores[memory_id] = scores.get(memory_id, 0) + rrf_contribution + score_boost
+    if fusion_method == "weighted":
+        # Weighted fusion: direct score combination
+        # semantic_weight * vector_score + keyword_weight * text_score
+        # Note: keyword results from FTS don't have scores, so we assign based on rank
 
-    # Score keyword results
-    for rank, memory in enumerate(keyword_results):
-        memory_id = memory["id"]
-        memories_by_id[memory_id] = memory
-        rrf_contribution = keyword_weight / (rrf_k + rank)
-        scores[memory_id] = scores.get(memory_id, 0) + rrf_contribution
+        # Score semantic results using actual similarity scores
+        for result in semantic_results:
+            memory = result.get("memory", result)
+            memory_id = memory["id"]
+            memories_by_id[memory_id] = memory
+            semantic_score = result.get("score", 0.0)
+            scores[memory_id] = semantic_weight * semantic_score
+
+        # Score keyword results - assign decreasing scores based on rank
+        # FTS results are already sorted by relevance, so rank 0 = most relevant
+        num_keyword = len(keyword_results)
+        for rank, memory in enumerate(keyword_results):
+            memory_id = memory["id"]
+            memories_by_id[memory_id] = memory
+            # Convert rank to a 0-1 score (rank 0 gets 1.0, last rank gets ~0)
+            if num_keyword > 1:
+                keyword_score = (
+                    1.0 - (rank / (num_keyword - 1)) * 0.9
+                )  # Range: 1.0 to 0.1
+            else:
+                keyword_score = 1.0
+            if memory_id in scores:
+                scores[memory_id] += keyword_weight * keyword_score
+            else:
+                scores[memory_id] = keyword_weight * keyword_score
+
+    else:
+        # RRF fusion (default): Reciprocal Rank Fusion
+        # RRF score = sum(1 / (k + rank)) where k is a constant (typically 60)
+        rrf_k = 60
+
+        # Score semantic results
+        for rank, result in enumerate(semantic_results):
+            memory = result.get("memory", result)
+            memory_id = memory["id"]
+            memories_by_id[memory_id] = memory
+            semantic_score = result.get("score", 0.0)
+            # Combine RRF with original semantic score for better ranking
+            rrf_contribution = semantic_weight / (rrf_k + rank)
+            score_boost = (
+                semantic_weight * semantic_score * 0.1
+            )  # Small boost from actual similarity
+            scores[memory_id] = (
+                scores.get(memory_id, 0) + rrf_contribution + score_boost
+            )
+
+        # Score keyword results
+        for rank, memory in enumerate(keyword_results):
+            memory_id = memory["id"]
+            memories_by_id[memory_id] = memory
+            rrf_contribution = keyword_weight / (rrf_k + rank)
+            scores[memory_id] = scores.get(memory_id, 0) + rrf_contribution
 
     # 4. Sort by combined score and apply filters
     sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
@@ -2267,10 +3268,12 @@ def hybrid_search(
             continue
 
         memory = memories_by_id[memory_id]
-        results.append({
-            "score": round(score, 4),
-            "memory": memory,
-        })
+        results.append(
+            {
+                "score": round(score, 4),
+                "memory": memory,
+            }
+        )
 
     return results
 
@@ -2313,15 +3316,13 @@ def _check_embedding_model_mismatch(conn: sqlite3.Connection) -> bool:
 
 def rebuild_embeddings(conn: sqlite3.Connection) -> int:
     """Rebuild all embeddings using current EMBEDDING_MODEL."""
-    rows = conn.execute(
-        "SELECT id, content, metadata, tags FROM memories"
-    ).fetchall()
+    rows = conn.execute("SELECT id, content, metadata, tags FROM memories").fetchall()
     updated = 0
     for row in rows:
         memory_id = row["id"]
         metadata = json.loads(row["metadata"]) if row["metadata"] else None
         tags = json.loads(row["tags"]) if row["tags"] else []
-        vector = _compute_embedding(row["content"], metadata, tags)
+        vector = _compute_embedding(row["content"], metadata, tags, conn)
         _upsert_embedding(conn, memory_id, vector)
         updated += 1
     # Store the model name after successful rebuild
@@ -2354,14 +3355,14 @@ def calculate_importance(
     # Recency decay (exponential, half-life = half_life_days)
     try:
         # Handle datetime with or without timezone/microseconds
-        created_str = created_at.replace('Z', '+00:00') if created_at else None
+        created_str = created_at.replace("Z", "+00:00") if created_at else None
         if created_str:
             # Try parsing as full datetime first
             try:
                 created = datetime.fromisoformat(created_str)
             except ValueError:
                 # Try simpler format
-                created = datetime.strptime(created_str[:19], '%Y-%m-%d %H:%M:%S')
+                created = datetime.strptime(created_str[:19], "%Y-%m-%d %H:%M:%S")
             age_days = (datetime.now() - created.replace(tzinfo=None)).days
             recency = 0.5 ** (age_days / half_life_days) if age_days >= 0 else 1.0
         else:
@@ -2378,7 +3379,7 @@ def calculate_importance(
 
 def _track_access(conn: sqlite3.Connection, memory_id: int) -> None:
     """Update access tracking for a memory (last_accessed and access_count)."""
-    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     conn.execute(
         """
         UPDATE memories
@@ -2449,7 +3450,9 @@ def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
             except json.JSONDecodeError:
                 pass
 
-    stats["tag_counts"] = dict(sorted(tag_counts.items(), key=lambda x: x[1], reverse=True))
+    stats["tag_counts"] = dict(
+        sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+    )
     stats["unique_tags"] = len(tag_counts)
 
     # Section statistics
@@ -2466,12 +3469,18 @@ def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
                         section_counts[section] = section_counts.get(section, 0) + 1
                     subsection = metadata.get("subsection")
                     if subsection:
-                        subsection_counts[subsection] = subsection_counts.get(subsection, 0) + 1
+                        subsection_counts[subsection] = (
+                            subsection_counts.get(subsection, 0) + 1
+                        )
             except json.JSONDecodeError:
                 pass
 
-    stats["section_counts"] = dict(sorted(section_counts.items(), key=lambda x: x[1], reverse=True))
-    stats["subsection_counts"] = dict(sorted(subsection_counts.items(), key=lambda x: x[1], reverse=True))
+    stats["section_counts"] = dict(
+        sorted(section_counts.items(), key=lambda x: x[1], reverse=True)
+    )
+    stats["subsection_counts"] = dict(
+        sorted(subsection_counts.items(), key=lambda x: x[1], reverse=True)
+    )
 
     # Date-based statistics (memories per month)
     monthly_counts: Dict[str, int] = {}
@@ -2516,26 +3525,393 @@ def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
             "newest": date_range[1],
         }
 
+    # Embedding cache statistics
+    if EMBEDDING_CACHE_ENABLED:
+        stats["embedding_cache"] = get_embedding_cache_stats(conn)
+
     return stats
 
 
-def export_memories(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    """Export all memories to a JSON-serializable list."""
+# ---------------------------------------------------------------------------
+# Cross-Session Memory Sharing Functions
+# ---------------------------------------------------------------------------
+
+
+def share_memory(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    source_agent: Optional[str] = None,
+    target_agents: Optional[List[str]] = None,
+    message: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Share a memory with other agents/sessions.
+
+    Args:
+        conn: Database connection
+        memory_id: ID of memory to share
+        source_agent: Agent ID of the sharer
+        target_agents: List of agent IDs to notify (None = broadcast to all)
+        message: Optional message to include with the share
+
+    Returns:
+        Dictionary with share event details
+    """
+    # Verify memory exists
+    memory = get_memory(conn, memory_id)
+    if not memory:
+        raise ValueError(f"Memory {memory_id} not found")
+
+    # Add shared-cache tag if not already present
+    tags = memory.get("tags", [])
+    if "shared-cache" not in tags:
+        tags = tags + ["shared-cache"]
+        update_memory(conn, memory_id, tags=tags)
+
+    # Create share event
+    target_agents_json = json.dumps(target_agents) if target_agents else None
+    cur = conn.execute(
+        """
+        INSERT INTO share_events (memory_id, source_agent, target_agents, message)
+        VALUES (?, ?, ?, ?)
+        """,
+        (memory_id, source_agent, target_agents_json, message),
+    )
+    event_id = cur.lastrowid
+
+    # Also emit a regular event for the events poll system
+    _emit_event(conn, memory_id, ["shared-cache", "memory_shared"])
+
+    conn.commit()
+
+    return {
+        "event_id": event_id,
+        "memory_id": memory_id,
+        "source_agent": source_agent,
+        "target_agents": target_agents,
+        "message": message,
+        "shared_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def get_shared_memories(
+    conn: sqlite3.Connection,
+    agent_id: Optional[str] = None,
+    since_timestamp: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Get memories shared with an agent.
+
+    Args:
+        conn: Database connection
+        agent_id: Agent to check shares for (None = all shares)
+        since_timestamp: Only get shares after this timestamp
+        limit: Maximum number of results
+
+    Returns:
+        Dictionary with count and list of share events
+    """
+    query = """
+        SELECT se.id, se.memory_id, se.source_agent, se.target_agents,
+               se.message, se.created_at, se.acknowledged_by,
+               m.content, m.metadata, m.tags
+        FROM share_events se
+        JOIN memories m ON se.memory_id = m.id
+        WHERE 1=1
+    """
+    params: List[Any] = []
+
+    # Filter by target agent if specified
+    if agent_id:
+        # Match if target_agents is NULL (broadcast) or contains the agent
+        query += " AND (se.target_agents IS NULL OR se.target_agents LIKE ?)"
+        params.append(f'%"{agent_id}"%')
+
+    # Filter by timestamp
+    if since_timestamp:
+        query += " AND se.created_at > ?"
+        params.append(since_timestamp)
+
+    query += " ORDER BY se.created_at DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(query, params).fetchall()
+
+    results = []
+    for row in rows:
+        target_agents = (
+            json.loads(row["target_agents"]) if row["target_agents"] else None
+        )
+        acknowledged_by = (
+            json.loads(row["acknowledged_by"]) if row["acknowledged_by"] else []
+        )
+        metadata = json.loads(row["metadata"]) if row["metadata"] else None
+        tags = json.loads(row["tags"]) if row["tags"] else []
+
+        results.append(
+            {
+                "event_id": row["id"],
+                "memory_id": row["memory_id"],
+                "source_agent": row["source_agent"],
+                "target_agents": target_agents,
+                "message": row["message"],
+                "shared_at": row["created_at"],
+                "acknowledged_by": acknowledged_by,
+                "memory": {
+                    "id": row["memory_id"],
+                    "content": row["content"],
+                    "metadata": metadata,
+                    "tags": tags,
+                },
+            }
+        )
+
+    return {
+        "count": len(results),
+        "shares": results,
+    }
+
+
+def acknowledge_share(
+    conn: sqlite3.Connection,
+    event_id: int,
+    agent_id: str,
+) -> Dict[str, Any]:
+    """Acknowledge receipt of a shared memory.
+
+    Args:
+        conn: Database connection
+        event_id: Share event ID to acknowledge
+        agent_id: Agent acknowledging the share
+
+    Returns:
+        Dictionary with acknowledgment status
+    """
+    row = conn.execute(
+        "SELECT acknowledged_by FROM share_events WHERE id = ?",
+        (event_id,),
+    ).fetchone()
+
+    if not row:
+        return {"error": "Share event not found", "event_id": event_id}
+
+    acknowledged_by = (
+        json.loads(row["acknowledged_by"]) if row["acknowledged_by"] else []
+    )
+
+    if agent_id not in acknowledged_by:
+        acknowledged_by.append(agent_id)
+        conn.execute(
+            "UPDATE share_events SET acknowledged_by = ? WHERE id = ?",
+            (json.dumps(acknowledged_by), event_id),
+        )
+        conn.commit()
+
+    return {
+        "event_id": event_id,
+        "agent_id": agent_id,
+        "acknowledged": True,
+        "all_acknowledged_by": acknowledged_by,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sync Version Tracking Functions
+# ---------------------------------------------------------------------------
+
+
+def get_current_sync_version(conn: sqlite3.Connection) -> int:
+    """Get the current global sync version."""
+    row = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = 'global_version'"
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def get_agent_sync_state(conn: sqlite3.Connection, agent_id: str) -> Dict[str, Any]:
+    """Get the sync state for a specific agent."""
+    row = conn.execute(
+        "SELECT last_sync_version, last_sync_at FROM sync_state WHERE agent_id = ?",
+        (agent_id,),
+    ).fetchone()
+    if row:
+        return {
+            "agent_id": agent_id,
+            "last_sync_version": row[0],
+            "last_sync_at": row[1],
+        }
+    return {
+        "agent_id": agent_id,
+        "last_sync_version": 0,
+        "last_sync_at": None,
+    }
+
+
+def update_agent_sync_state(
+    conn: sqlite3.Connection, agent_id: str, sync_version: int
+) -> None:
+    """Update the sync state for an agent after a successful sync."""
+    conn.execute(
+        """
+        INSERT INTO sync_state (agent_id, last_sync_version, last_sync_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(agent_id) DO UPDATE SET
+            last_sync_version = excluded.last_sync_version,
+            last_sync_at = excluded.last_sync_at
+        """,
+        (agent_id, sync_version),
+    )
+    conn.commit()
+
+
+def sync_delta(
+    conn: sqlite3.Connection,
+    since_version: int,
+    include_deleted: bool = True,
+    agent_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Get all changes since a version number for delta sync.
+
+    Args:
+        conn: Database connection
+        since_version: Get changes after this version (exclusive)
+        include_deleted: Include deleted memory records
+        agent_id: If provided, update agent's sync state after query
+
+    Returns:
+        Dictionary with current_version and list of changes
+    """
+    current_version = get_current_sync_version(conn)
+
+    changes: List[Dict[str, Any]] = []
+
+    # Get created/updated memories
     rows = conn.execute(
-        "SELECT id, content, metadata, tags, created_at FROM memories ORDER BY id"
+        """
+        SELECT id, content, metadata, tags, created_at, updated_at,
+               tier, expires_at, importance, sync_version
+        FROM memories
+        WHERE sync_version > ?
+        ORDER BY sync_version ASC
+        """,
+        (since_version,),
+    ).fetchall()
+
+    for row in rows:
+        metadata = json.loads(row["metadata"]) if row["metadata"] else None
+        tags = json.loads(row["tags"]) if row["tags"] else []
+
+        # Determine if this is a create or update based on created_at vs updated_at
+        action = "update" if row["updated_at"] else "create"
+
+        changes.append(
+            {
+                "action": action,
+                "sync_version": row["sync_version"],
+                "memory": {
+                    "id": row["id"],
+                    "content": row["content"],
+                    "metadata": metadata,
+                    "tags": tags,
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "tier": row["tier"] or DEFAULT_TIER,
+                    "expires_at": row["expires_at"],
+                    "importance": row["importance"] or 1.0,
+                },
+            }
+        )
+
+    # Get deleted memories
+    if include_deleted:
+        deleted_rows = conn.execute(
+            """
+            SELECT memory_id, content_preview, deleted_at, sync_version
+            FROM deleted_memories
+            WHERE sync_version > ?
+            ORDER BY sync_version ASC
+            """,
+            (since_version,),
+        ).fetchall()
+
+        for row in deleted_rows:
+            changes.append(
+                {
+                    "action": "delete",
+                    "sync_version": row["sync_version"],
+                    "memory_id": row["memory_id"],
+                    "content_preview": row["content_preview"],
+                    "deleted_at": row["deleted_at"],
+                }
+            )
+
+    # Sort all changes by sync_version
+    changes.sort(key=lambda x: x["sync_version"])
+
+    # Update agent sync state if agent_id provided
+    if agent_id and changes:
+        update_agent_sync_state(conn, agent_id, current_version)
+
+    return {
+        "current_version": current_version,
+        "since_version": since_version,
+        "change_count": len(changes),
+        "changes": changes,
+    }
+
+
+def cleanup_deleted_memories(
+    conn: sqlite3.Connection, older_than_days: int = 30
+) -> int:
+    """Remove old deleted memory records that are no longer needed for sync.
+
+    Args:
+        conn: Database connection
+        older_than_days: Delete records older than this many days
+
+    Returns:
+        Number of records deleted
+    """
+    cur = conn.execute(
+        """
+        DELETE FROM deleted_memories
+        WHERE deleted_at < datetime('now', ?)
+        """,
+        (f"-{older_than_days} days",),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def export_memories(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Export all memories to a JSON-serializable list.
+
+    Includes tier and expires_at fields for lossless backup/restore.
+    """
+    rows = conn.execute(
+        "SELECT id, content, metadata, tags, created_at, updated_at, tier, expires_at, importance FROM memories ORDER BY id"
     ).fetchall()
 
     exported: List[Dict[str, Any]] = []
     for row in rows:
         metadata = row["metadata"]
         tags = row["tags"]
-        exported.append({
+        entry = {
             "id": row["id"],
             "content": row["content"],
             "metadata": json.loads(metadata) if metadata else None,
             "tags": json.loads(tags) if tags else [],
             "created_at": row["created_at"],
-        })
+        }
+        # Include optional fields if present
+        if row["updated_at"]:
+            entry["updated_at"] = row["updated_at"]
+        if row["tier"] and row["tier"] != DEFAULT_TIER:
+            entry["tier"] = row["tier"]
+        if row["expires_at"]:
+            entry["expires_at"] = row["expires_at"]
+        if row["importance"] and row["importance"] != 1.0:
+            entry["importance"] = row["importance"]
+        exported.append(entry)
 
     return exported
 
@@ -2591,32 +3967,56 @@ def import_memories(
             metadata = entry.get("metadata")
             tags = entry.get("tags", [])
             created_at = entry.get("created_at")
+            tier = _validate_tier(entry.get("tier"))
+            expires_at = _normalize_expires_at(entry.get("expires_at"))
+            importance = entry.get("importance", 1.0)
 
             # Prepare data
             prepared_metadata = _prepare_metadata(metadata) if metadata else None
             validated_tags = _validate_tags(tags)
             _enforce_tag_whitelist(validated_tags)
 
-            metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
+            metadata_json = (
+                json.dumps(prepared_metadata, ensure_ascii=False)
+                if prepared_metadata
+                else None
+            )
             tags_json = json.dumps(validated_tags, ensure_ascii=False)
 
-            # Insert with optional created_at preservation
+            # Insert with all fields preserved
             if created_at:
                 cur = conn.execute(
-                    "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
-                    (content, metadata_json, tags_json, created_at),
+                    "INSERT INTO memories (content, metadata, tags, created_at, tier, expires_at, importance) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        content,
+                        metadata_json,
+                        tags_json,
+                        created_at,
+                        tier,
+                        expires_at,
+                        importance,
+                    ),
                 )
             else:
                 cur = conn.execute(
-                    "INSERT INTO memories (content, metadata, tags) VALUES (?, ?, ?)",
-                    (content, metadata_json, tags_json),
+                    "INSERT INTO memories (content, metadata, tags, tier, expires_at, importance) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        content,
+                        metadata_json,
+                        tags_json,
+                        tier,
+                        expires_at,
+                        importance,
+                    ),
                 )
 
             memory_id = cur.lastrowid
 
             # Update FTS and embeddings
             _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
-            vector = _compute_embedding(content, prepared_metadata, validated_tags)
+            vector = _compute_embedding(
+                content, prepared_metadata, validated_tags, conn
+            )
             _upsert_embedding(conn, memory_id, vector)
 
             imported += 1
@@ -2645,7 +4045,9 @@ def poll_events(
     unconsumed_only: bool = True,
 ) -> List[Dict[str, Any]]:
     """Poll for memory events."""
-    query = "SELECT id, memory_id, tags, timestamp, consumed FROM memories_events WHERE 1=1"
+    query = (
+        "SELECT id, memory_id, tags, timestamp, consumed FROM memories_events WHERE 1=1"
+    )
     params: List[Any] = []
 
     if unconsumed_only:
@@ -2657,7 +4059,9 @@ def poll_events(
 
     if tags_filter:
         # Check if any of the filter tags are in the event's tags JSON array
-        tag_conditions = " OR ".join(["json_extract(tags, '$') LIKE ?" for _ in tags_filter])
+        tag_conditions = " OR ".join(
+            ["json_extract(tags, '$') LIKE ?" for _ in tags_filter]
+        )
         query += f" AND ({tag_conditions})"
         for tag in tags_filter:
             params.append(f'%"{tag}"%')
@@ -2668,13 +4072,15 @@ def poll_events(
 
     events = []
     for row in rows:
-        events.append({
-            "id": row["id"],
-            "memory_id": row["memory_id"],
-            "tags": json.loads(row["tags"]) if row["tags"] else [],
-            "timestamp": row["timestamp"],
-            "consumed": bool(row["consumed"]),
-        })
+        events.append(
+            {
+                "id": row["id"],
+                "memory_id": row["memory_id"],
+                "tags": json.loads(row["tags"]) if row["tags"] else [],
+                "timestamp": row["timestamp"],
+                "consumed": bool(row["consumed"]),
+            }
+        )
 
     return events
 
@@ -2687,7 +4093,1264 @@ def clear_events(conn: sqlite3.Connection, event_ids: List[int]) -> int:
     placeholders = ",".join(["?" for _ in event_ids])
     conn.execute(
         f"UPDATE memories_events SET consumed = 1 WHERE id IN ({placeholders})",
-        event_ids
+        event_ids,
     )
     conn.commit()
     return len(event_ids)
+
+
+def cleanup_expired_memories(
+    conn: sqlite3.Connection,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Delete expired daily tier memories.
+
+    Removes memories where:
+    - tier = 'daily'
+    - expires_at is not null
+    - expires_at < current time
+
+    Args:
+        conn: Database connection
+        dry_run: If True, only report what would be deleted without actually deleting
+
+    Returns:
+        Dictionary with count of deleted memories and their IDs
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Find expired memories
+    rows = conn.execute(
+        """
+        SELECT id, content, expires_at, created_at
+        FROM memories
+        WHERE tier = 'daily'
+          AND expires_at IS NOT NULL
+          AND expires_at < ?
+        ORDER BY expires_at ASC
+        """,
+        (now,),
+    ).fetchall()
+
+    expired_ids = [row["id"] for row in rows]
+    expired_details = [
+        {
+            "id": row["id"],
+            "preview": row["content"][:80] + "..."
+            if len(row["content"]) > 80
+            else row["content"],
+            "expires_at": row["expires_at"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "would_delete": len(expired_ids),
+            "expired_memories": expired_details,
+        }
+
+    # Actually delete the expired memories
+    deleted_count = 0
+    for memory_id in expired_ids:
+        if delete_memory(conn, memory_id):
+            deleted_count += 1
+
+    return {
+        "deleted": deleted_count,
+        "expired_memory_ids": expired_ids,
+        "details": expired_details,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Session Transcript Indexing
+# ---------------------------------------------------------------------------
+
+
+def index_conversation(
+    conn: sqlite3.Connection,
+    messages: List[Dict[str, Any]],
+    session_id: Optional[str] = None,
+    title: Optional[str] = None,
+    chunk_size: int = 10,
+    overlap: int = 2,
+    tags: Optional[List[str]] = None,
+    create_memories: bool = True,
+) -> Dict[str, Any]:
+    """
+    Index a conversation for semantic search.
+
+    Chunks the conversation and optionally creates memory entries for each chunk
+    that can be found via semantic search.
+
+    Args:
+        conn: Database connection
+        messages: List of message dicts with 'role', 'content', and optional 'timestamp'
+        session_id: Unique session identifier (auto-generated if not provided)
+        title: Optional title for the session
+        chunk_size: Messages per chunk (default: 10)
+        overlap: Overlap between chunks (default: 2)
+        tags: Additional tags to apply to created memories
+        create_memories: If True, create memory entries for each chunk (default: True)
+
+    Returns:
+        Dict with session_id, chunks_created, memories_created, message_count
+    """
+    if not messages:
+        return {"error": "no_messages", "message": "No messages to index"}
+
+    # Generate session_id if not provided
+    if not session_id:
+        import uuid
+        from datetime import datetime
+
+        session_id = (
+            f"session-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        )
+
+    # Create chunks
+    chunks = chunk_conversation(messages, chunk_size=chunk_size, overlap=overlap)
+
+    # Prepare base tags
+    base_tags = ["session", f"session/{session_id}"]
+    if tags:
+        base_tags.extend(tags)
+
+    # Store session metadata
+    metadata_json = json.dumps(
+        {
+            "chunk_size": chunk_size,
+            "overlap": overlap,
+        }
+    )
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO sessions
+        (session_id, title, message_count, chunk_count, metadata, updated_at, last_indexed_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        """,
+        (session_id, title, len(messages), len(chunks), metadata_json),
+    )
+
+    # Store chunks and optionally create memories
+    memories_created = []
+    for chunk in chunks:
+        chunk_index = chunk.get("chunk_index", 0)
+        message_range = chunk.get("message_range", (0, 0))
+        content = chunk["content"]
+
+        memory_id = None
+        if create_memories:
+            # Create a memory for this chunk
+            chunk_tags = base_tags + [f"chunk/{chunk_index}"]
+            memory = add_memory(
+                conn,
+                content=content,
+                tags=chunk_tags,
+                metadata={
+                    "type": "session_chunk",
+                    "session_id": session_id,
+                    "chunk_index": chunk_index,
+                    "message_range": list(message_range),
+                },
+            )
+            memory_id = memory["id"]
+            memories_created.append(memory_id)
+
+        # Store chunk reference
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO session_chunks
+            (session_id, chunk_index, content, message_start, message_end, memory_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                chunk_index,
+                content,
+                message_range[0],
+                message_range[1],
+                memory_id,
+            ),
+        )
+
+    conn.commit()
+
+    return {
+        "session_id": session_id,
+        "title": title,
+        "message_count": len(messages),
+        "chunks_created": len(chunks),
+        "memories_created": memories_created,
+    }
+
+
+def index_conversation_delta(
+    conn: sqlite3.Connection,
+    session_id: str,
+    new_messages: List[Dict[str, Any]],
+    chunk_size: int = 10,
+    overlap: int = 2,
+    tags: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Incrementally index new messages for an existing session.
+
+    Only indexes messages that haven't been indexed yet (delta-based).
+
+    Args:
+        conn: Database connection
+        session_id: Existing session identifier
+        new_messages: New messages to add and index
+        chunk_size: Messages per chunk (default: 10)
+        overlap: Overlap between chunks (default: 2)
+        tags: Additional tags for new memories
+
+    Returns:
+        Dict with new_chunks_created, new_memories_created, total_message_count
+    """
+    # Get existing session info
+    session = conn.execute(
+        "SELECT message_count, chunk_count FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+
+    if not session:
+        return {"error": "session_not_found", "session_id": session_id}
+
+    existing_message_count = session[0]
+    existing_chunk_count = session[1]
+
+    if not new_messages:
+        return {
+            "session_id": session_id,
+            "new_chunks_created": 0,
+            "new_memories_created": [],
+            "total_message_count": existing_message_count,
+        }
+
+    # Get existing chunks to find last indexed content
+    last_chunk = conn.execute(
+        """
+        SELECT message_end FROM session_chunks
+        WHERE session_id = ?
+        ORDER BY chunk_index DESC LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone()
+
+    # Prepare base tags
+    base_tags = ["session", f"session/{session_id}"]
+    if tags:
+        base_tags.extend(tags)
+
+    # Create chunks for new messages
+    chunks = chunk_conversation(new_messages, chunk_size=chunk_size, overlap=overlap)
+
+    # Adjust chunk indices and message ranges
+    new_chunk_start = existing_chunk_count
+    message_offset = existing_message_count
+
+    memories_created = []
+    for i, chunk in enumerate(chunks):
+        chunk_index = new_chunk_start + i
+        original_range = chunk.get("message_range", (0, 0))
+        # Adjust message range to global indices
+        message_range = (
+            message_offset + original_range[0],
+            message_offset + original_range[1],
+        )
+        content = chunk["content"]
+
+        # Create a memory for this chunk
+        chunk_tags = base_tags + [f"chunk/{chunk_index}"]
+        memory = add_memory(
+            conn,
+            content=content,
+            tags=chunk_tags,
+            metadata={
+                "type": "session_chunk",
+                "session_id": session_id,
+                "chunk_index": chunk_index,
+                "message_range": list(message_range),
+                "is_delta": True,
+            },
+        )
+        memory_id = memory["id"]
+        memories_created.append(memory_id)
+
+        # Store chunk reference
+        conn.execute(
+            """
+            INSERT INTO session_chunks
+            (session_id, chunk_index, content, message_start, message_end, memory_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                chunk_index,
+                content,
+                message_range[0],
+                message_range[1],
+                memory_id,
+            ),
+        )
+
+    # Update session metadata
+    new_total_messages = existing_message_count + len(new_messages)
+    new_total_chunks = existing_chunk_count + len(chunks)
+
+    conn.execute(
+        """
+        UPDATE sessions
+        SET message_count = ?, chunk_count = ?, updated_at = datetime('now'), last_indexed_at = datetime('now')
+        WHERE session_id = ?
+        """,
+        (new_total_messages, new_total_chunks, session_id),
+    )
+
+    conn.commit()
+
+    return {
+        "session_id": session_id,
+        "new_chunks_created": len(chunks),
+        "new_memories_created": memories_created,
+        "total_message_count": new_total_messages,
+        "total_chunk_count": new_total_chunks,
+    }
+
+
+def get_session(conn: sqlite3.Connection, session_id: str) -> Optional[Dict[str, Any]]:
+    """Get session metadata by ID."""
+    row = conn.execute(
+        """
+        SELECT session_id, title, created_at, updated_at, last_indexed_at,
+               message_count, chunk_count, metadata
+        FROM sessions WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "session_id": row[0],
+        "title": row[1],
+        "created_at": row[2],
+        "updated_at": row[3],
+        "last_indexed_at": row[4],
+        "message_count": row[5],
+        "chunk_count": row[6],
+        "metadata": json.loads(row[7]) if row[7] else {},
+    }
+
+
+def list_sessions(
+    conn: sqlite3.Connection,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List all indexed sessions."""
+    query = """
+        SELECT session_id, title, created_at, updated_at, last_indexed_at,
+               message_count, chunk_count
+        FROM sessions
+        WHERE 1=1
+    """
+    params: List[Any] = []
+
+    if date_from:
+        query += " AND created_at >= ?"
+        params.append(date_from)
+    if date_to:
+        query += " AND created_at <= ?"
+        params.append(date_to)
+
+    query += " ORDER BY updated_at DESC"
+
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    if offset:
+        query += " OFFSET ?"
+        params.append(offset)
+
+    rows = conn.execute(query, params).fetchall()
+
+    return [
+        {
+            "session_id": row[0],
+            "title": row[1],
+            "created_at": row[2],
+            "updated_at": row[3],
+            "last_indexed_at": row[4],
+            "message_count": row[5],
+            "chunk_count": row[6],
+        }
+        for row in rows
+    ]
+
+
+def search_sessions(
+    conn: sqlite3.Connection,
+    query: str,
+    session_ids: Optional[List[str]] = None,
+    top_k: int = 10,
+    min_score: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """
+    Search across indexed session chunks using semantic search.
+
+    Args:
+        conn: Database connection
+        query: Search query
+        session_ids: Optional list of session IDs to search within
+        top_k: Maximum results to return
+        min_score: Minimum similarity score
+
+    Returns:
+        List of search results with session context
+    """
+    # Use the existing semantic search but filter by session tags
+    metadata_filters = {"type": "session_chunk"}
+
+    results = semantic_search(
+        conn,
+        query,
+        top_k=top_k * 2,
+        min_score=min_score,  # Get more to filter
+    )
+
+    # Filter and enhance with session context
+    session_results = []
+    for result in results:
+        memory = result.get("memory", {})
+        metadata = memory.get("metadata", {})
+
+        # Check if this is a session chunk
+        if metadata.get("type") != "session_chunk":
+            continue
+
+        # Filter by session_ids if specified
+        mem_session_id = metadata.get("session_id")
+        if session_ids and mem_session_id not in session_ids:
+            continue
+
+        # Get session info
+        session = get_session(conn, mem_session_id)
+
+        session_results.append(
+            {
+                "score": result.get("score", 0),
+                "memory_id": memory.get("id"),
+                "content": memory.get("content"),
+                "session_id": mem_session_id,
+                "session_title": session.get("title") if session else None,
+                "chunk_index": metadata.get("chunk_index"),
+                "message_range": metadata.get("message_range"),
+            }
+        )
+
+        if len(session_results) >= top_k:
+            break
+
+    return session_results
+
+
+def delete_session(conn: sqlite3.Connection, session_id: str) -> Dict[str, Any]:
+    """
+    Delete a session and all its associated chunks and memories.
+
+    Args:
+        conn: Database connection
+        session_id: Session to delete
+
+    Returns:
+        Dict with deleted counts
+    """
+    # Get memory IDs associated with this session
+    rows = conn.execute(
+        "SELECT memory_id FROM session_chunks WHERE session_id = ? AND memory_id IS NOT NULL",
+        (session_id,),
+    ).fetchall()
+
+    memory_ids = [row[0] for row in rows]
+
+    # Delete memories
+    deleted_memories = 0
+    for memory_id in memory_ids:
+        if delete_memory(conn, memory_id):
+            deleted_memories += 1
+
+    # Delete chunks (cascades from session delete due to FK)
+    conn.execute("DELETE FROM session_chunks WHERE session_id = ?", (session_id,))
+
+    # Delete session
+    result = conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+    session_deleted = result.rowcount > 0
+
+    conn.commit()
+
+    return {
+        "session_id": session_id,
+        "session_deleted": session_deleted,
+        "chunks_deleted": len(memory_ids),
+        "memories_deleted": deleted_memories,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Identity Links (Entity Unification)
+# ---------------------------------------------------------------------------
+
+# Valid entity types for identities
+VALID_ENTITY_TYPES = {"person", "organization", "project", "tool", "concept", "other"}
+
+
+def create_identity(
+    conn: sqlite3.Connection,
+    canonical_id: str,
+    display_name: str,
+    entity_type: str = "person",
+    aliases: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Create a canonical identity with optional aliases.
+
+    An identity represents a unique entity (person, organization, etc.)
+    that can be referenced across multiple memories.
+
+    Args:
+        conn: Database connection
+        canonical_id: Unique identifier (e.g., "user:ronaldo", "org:acme")
+        display_name: Human-readable name
+        entity_type: Type of entity (person, organization, project, tool, concept, other)
+        aliases: Alternative names/IDs for this identity
+        metadata: Additional metadata
+
+    Returns:
+        Created identity dict with canonical_id, display_name, entity_type, aliases
+    """
+    if entity_type not in VALID_ENTITY_TYPES:
+        raise ValueError(
+            f"Invalid entity_type '{entity_type}'. Must be one of: {', '.join(sorted(VALID_ENTITY_TYPES))}"
+        )
+
+    metadata_json = json.dumps(metadata or {})
+
+    try:
+        conn.execute(
+            """
+            INSERT INTO identities (canonical_id, display_name, entity_type, metadata)
+            VALUES (?, ?, ?, ?)
+            """,
+            (canonical_id, display_name, entity_type, metadata_json),
+        )
+    except sqlite3.IntegrityError:
+        raise ValueError(f"Identity '{canonical_id}' already exists")
+
+    # Add aliases if provided
+    aliases_added = []
+    if aliases:
+        for alias in aliases:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO identity_aliases (alias, canonical_id, source)
+                    VALUES (?, ?, 'manual')
+                    """,
+                    (alias, canonical_id),
+                )
+                aliases_added.append(alias)
+            except sqlite3.IntegrityError:
+                # Alias already exists, skip
+                pass
+
+    conn.commit()
+
+    return {
+        "canonical_id": canonical_id,
+        "display_name": display_name,
+        "entity_type": entity_type,
+        "aliases": aliases_added,
+        "metadata": metadata or {},
+    }
+
+
+def get_identity(
+    conn: sqlite3.Connection, canonical_id: str
+) -> Optional[Dict[str, Any]]:
+    """Get an identity by its canonical ID."""
+    row = conn.execute(
+        """
+        SELECT canonical_id, display_name, entity_type, metadata, created_at, updated_at
+        FROM identities WHERE canonical_id = ?
+        """,
+        (canonical_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    # Get aliases
+    alias_rows = conn.execute(
+        "SELECT alias, source FROM identity_aliases WHERE canonical_id = ?",
+        (canonical_id,),
+    ).fetchall()
+
+    return {
+        "canonical_id": row[0],
+        "display_name": row[1],
+        "entity_type": row[2],
+        "metadata": json.loads(row[3]) if row[3] else {},
+        "created_at": row[4],
+        "updated_at": row[5],
+        "aliases": [{"alias": a[0], "source": a[1]} for a in alias_rows],
+    }
+
+
+def resolve_identity(conn: sqlite3.Connection, alias_or_id: str) -> Optional[str]:
+    """
+    Resolve an alias or canonical ID to the canonical ID.
+
+    Args:
+        conn: Database connection
+        alias_or_id: Either a canonical_id or an alias
+
+    Returns:
+        The canonical_id if found, None otherwise
+    """
+    # First check if it's a canonical ID
+    row = conn.execute(
+        "SELECT canonical_id FROM identities WHERE canonical_id = ?",
+        (alias_or_id,),
+    ).fetchone()
+    if row:
+        return row[0]
+
+    # Check aliases
+    row = conn.execute(
+        "SELECT canonical_id FROM identity_aliases WHERE alias = ?",
+        (alias_or_id,),
+    ).fetchone()
+    if row:
+        return row[0]
+
+    return None
+
+
+def add_identity_alias(
+    conn: sqlite3.Connection,
+    canonical_id: str,
+    alias: str,
+    source: str = "manual",
+) -> Dict[str, Any]:
+    """
+    Add an alias to an existing identity.
+
+    Args:
+        conn: Database connection
+        canonical_id: The identity to add the alias to
+        alias: The new alias
+        source: Source of the alias (e.g., "github", "email", "manual")
+
+    Returns:
+        Dict with the added alias info
+    """
+    # Verify identity exists
+    if not get_identity(conn, canonical_id):
+        raise ValueError(f"Identity '{canonical_id}' not found")
+
+    try:
+        conn.execute(
+            """
+            INSERT INTO identity_aliases (alias, canonical_id, source)
+            VALUES (?, ?, ?)
+            """,
+            (alias, canonical_id, source),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise ValueError(f"Alias '{alias}' already exists")
+
+    return {"alias": alias, "canonical_id": canonical_id, "source": source}
+
+
+def link_memory_to_identity(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    identity_id: str,
+    mention_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Link a memory to an identity.
+
+    This creates a bidirectional relationship - you can find memories by identity
+    and identities mentioned in a memory.
+
+    Args:
+        conn: Database connection
+        memory_id: The memory to link
+        identity_id: The identity (canonical_id or alias) to link to
+        mention_text: Optional text that triggered the link (e.g., "@ronaldo")
+
+    Returns:
+        Dict with the link info
+    """
+    # Resolve identity (could be alias)
+    canonical_id = resolve_identity(conn, identity_id)
+    if not canonical_id:
+        raise ValueError(f"Identity '{identity_id}' not found")
+
+    # Verify memory exists
+    memory = get_memory(conn, memory_id)
+    if not memory:
+        raise ValueError(f"Memory {memory_id} not found")
+
+    try:
+        conn.execute(
+            """
+            INSERT INTO memory_identity_links (memory_id, identity_id, mention_text)
+            VALUES (?, ?, ?)
+            """,
+            (memory_id, canonical_id, mention_text),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Link already exists
+        pass
+
+    return {
+        "memory_id": memory_id,
+        "identity_id": canonical_id,
+        "mention_text": mention_text,
+    }
+
+
+def unlink_memory_from_identity(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    identity_id: str,
+) -> Dict[str, Any]:
+    """Remove a link between a memory and an identity."""
+    canonical_id = resolve_identity(conn, identity_id)
+    if not canonical_id:
+        canonical_id = identity_id  # Use as-is if not found
+
+    result = conn.execute(
+        "DELETE FROM memory_identity_links WHERE memory_id = ? AND identity_id = ?",
+        (memory_id, canonical_id),
+    )
+    conn.commit()
+
+    return {
+        "memory_id": memory_id,
+        "identity_id": canonical_id,
+        "removed": result.rowcount > 0,
+    }
+
+
+def get_memories_by_identity(
+    conn: sqlite3.Connection,
+    identity_id: str,
+    include_aliases: bool = True,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Find all memories linked to an identity.
+
+    Args:
+        conn: Database connection
+        identity_id: The identity (canonical_id or alias)
+        include_aliases: If True, also search by aliases
+        limit: Maximum memories to return
+
+    Returns:
+        List of memories with their link info
+    """
+    canonical_id = resolve_identity(conn, identity_id)
+    if not canonical_id:
+        return []
+
+    query = """
+        SELECT m.id, m.content, m.metadata, m.tags, m.created_at,
+               mil.mention_text, mil.created_at as link_created_at
+        FROM memories m
+        JOIN memory_identity_links mil ON m.id = mil.memory_id
+        WHERE mil.identity_id = ?
+        ORDER BY m.created_at DESC
+    """
+    params: List[Any] = [canonical_id]
+
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    rows = conn.execute(query, params).fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "content": row[1],
+            "metadata": json.loads(row[2]) if row[2] else {},
+            "tags": json.loads(row[3]) if row[3] else [],
+            "created_at": row[4],
+            "mention_text": row[5],
+            "link_created_at": row[6],
+        }
+        for row in rows
+    ]
+
+
+def get_identities_in_memory(
+    conn: sqlite3.Connection,
+    memory_id: int,
+) -> List[Dict[str, Any]]:
+    """
+    Get all identities linked to a memory.
+
+    Args:
+        conn: Database connection
+        memory_id: The memory ID
+
+    Returns:
+        List of identities with their link info
+    """
+    rows = conn.execute(
+        """
+        SELECT i.canonical_id, i.display_name, i.entity_type,
+               mil.mention_text, mil.created_at as link_created_at
+        FROM identities i
+        JOIN memory_identity_links mil ON i.canonical_id = mil.identity_id
+        WHERE mil.memory_id = ?
+        ORDER BY mil.created_at
+        """,
+        (memory_id,),
+    ).fetchall()
+
+    return [
+        {
+            "canonical_id": row[0],
+            "display_name": row[1],
+            "entity_type": row[2],
+            "mention_text": row[3],
+            "link_created_at": row[4],
+        }
+        for row in rows
+    ]
+
+
+def list_identities(
+    conn: sqlite3.Connection,
+    entity_type: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    List all identities.
+
+    Args:
+        conn: Database connection
+        entity_type: Filter by entity type
+        limit: Maximum identities to return
+        offset: Offset for pagination
+
+    Returns:
+        List of identities with memory counts
+    """
+    query = """
+        SELECT i.canonical_id, i.display_name, i.entity_type, i.created_at,
+               COUNT(mil.memory_id) as memory_count
+        FROM identities i
+        LEFT JOIN memory_identity_links mil ON i.canonical_id = mil.identity_id
+    """
+    params: List[Any] = []
+
+    if entity_type:
+        query += " WHERE i.entity_type = ?"
+        params.append(entity_type)
+
+    query += " GROUP BY i.canonical_id ORDER BY i.display_name"
+
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    if offset:
+        query += " OFFSET ?"
+        params.append(offset)
+
+    rows = conn.execute(query, params).fetchall()
+
+    return [
+        {
+            "canonical_id": row[0],
+            "display_name": row[1],
+            "entity_type": row[2],
+            "created_at": row[3],
+            "memory_count": row[4],
+        }
+        for row in rows
+    ]
+
+
+def update_identity(
+    conn: sqlite3.Connection,
+    canonical_id: str,
+    display_name: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update an identity's properties."""
+    identity = get_identity(conn, canonical_id)
+    if not identity:
+        return None
+
+    updates = []
+    params: List[Any] = []
+
+    if display_name is not None:
+        updates.append("display_name = ?")
+        params.append(display_name)
+
+    if entity_type is not None:
+        if entity_type not in VALID_ENTITY_TYPES:
+            raise ValueError(f"Invalid entity_type '{entity_type}'")
+        updates.append("entity_type = ?")
+        params.append(entity_type)
+
+    if metadata is not None:
+        updates.append("metadata = ?")
+        params.append(json.dumps(metadata))
+
+    if updates:
+        updates.append("updated_at = datetime('now')")
+        params.append(canonical_id)
+        conn.execute(
+            f"UPDATE identities SET {', '.join(updates)} WHERE canonical_id = ?",
+            params,
+        )
+        conn.commit()
+
+    return get_identity(conn, canonical_id)
+
+
+def delete_identity(conn: sqlite3.Connection, canonical_id: str) -> Dict[str, Any]:
+    """
+    Delete an identity and all its links.
+
+    Args:
+        conn: Database connection
+        canonical_id: Identity to delete
+
+    Returns:
+        Dict with deletion info
+    """
+    # Count links before deletion
+    link_count = conn.execute(
+        "SELECT COUNT(*) FROM memory_identity_links WHERE identity_id = ?",
+        (canonical_id,),
+    ).fetchone()[0]
+
+    alias_count = conn.execute(
+        "SELECT COUNT(*) FROM identity_aliases WHERE canonical_id = ?",
+        (canonical_id,),
+    ).fetchone()[0]
+
+    # Delete (cascades to aliases and links)
+    result = conn.execute(
+        "DELETE FROM identities WHERE canonical_id = ?",
+        (canonical_id,),
+    )
+    conn.commit()
+
+    return {
+        "canonical_id": canonical_id,
+        "deleted": result.rowcount > 0,
+        "links_removed": link_count,
+        "aliases_removed": alias_count,
+    }
+
+
+def search_identities(
+    conn: sqlite3.Connection,
+    query: str,
+    entity_type: Optional[str] = None,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    Search identities by name or alias.
+
+    Args:
+        conn: Database connection
+        query: Search query (matches display_name, canonical_id, or aliases)
+        entity_type: Optional filter by entity type
+        limit: Maximum results
+
+    Returns:
+        List of matching identities
+    """
+    search_pattern = f"%{query}%"
+
+    sql = """
+        SELECT DISTINCT i.canonical_id, i.display_name, i.entity_type, i.created_at
+        FROM identities i
+        LEFT JOIN identity_aliases ia ON i.canonical_id = ia.canonical_id
+        WHERE (i.display_name LIKE ? OR i.canonical_id LIKE ? OR ia.alias LIKE ?)
+    """
+    params: List[Any] = [search_pattern, search_pattern, search_pattern]
+
+    if entity_type:
+        sql += " AND i.entity_type = ?"
+        params.append(entity_type)
+
+    sql += " ORDER BY i.display_name LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
+
+    return [
+        {
+            "canonical_id": row[0],
+            "display_name": row[1],
+            "entity_type": row[2],
+            "created_at": row[3],
+        }
+        for row in rows
+    ]
+
+
+# ============================================================================
+# Workspace Management
+# ============================================================================
+
+
+def list_workspaces(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """
+    List all workspaces with memory counts.
+
+    Returns:
+        List of workspaces with name and memory_count
+    """
+    _ensure_workspace_column(conn)
+
+    rows = conn.execute(
+        """
+        SELECT
+            COALESCE(workspace, ?) as workspace_name,
+            COUNT(*) as memory_count,
+            MIN(created_at) as first_memory,
+            MAX(created_at) as last_memory
+        FROM memories
+        GROUP BY COALESCE(workspace, ?)
+        ORDER BY memory_count DESC
+        """,
+        (DEFAULT_WORKSPACE, DEFAULT_WORKSPACE),
+    ).fetchall()
+
+    return [
+        {
+            "workspace": row[0],
+            "memory_count": row[1],
+            "first_memory": row[2],
+            "last_memory": row[3],
+        }
+        for row in rows
+    ]
+
+
+def get_workspace_stats(conn: sqlite3.Connection, workspace: str) -> Dict[str, Any]:
+    """
+    Get statistics for a specific workspace.
+
+    Args:
+        conn: Database connection
+        workspace: Workspace name
+
+    Returns:
+        Dictionary with workspace statistics
+    """
+    _ensure_workspace_column(conn)
+
+    # Basic memory count
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) as total_memories,
+            SUM(CASE WHEN tier = 'daily' THEN 1 ELSE 0 END) as daily_memories,
+            SUM(CASE WHEN tier = 'permanent' OR tier IS NULL THEN 1 ELSE 0 END) as permanent_memories,
+            MIN(created_at) as first_memory,
+            MAX(created_at) as last_memory,
+            AVG(importance) as avg_importance
+        FROM memories
+        WHERE COALESCE(workspace, ?) = ?
+        """,
+        (DEFAULT_WORKSPACE, workspace),
+    ).fetchone()
+
+    if not row or row[0] == 0:
+        return {
+            "workspace": workspace,
+            "exists": False,
+            "total_memories": 0,
+        }
+
+    # Tag distribution
+    tag_rows = conn.execute(
+        """
+        SELECT tags FROM memories
+        WHERE COALESCE(workspace, ?) = ? AND tags IS NOT NULL
+        """,
+        (DEFAULT_WORKSPACE, workspace),
+    ).fetchall()
+
+    tag_counts: Dict[str, int] = {}
+    for tr in tag_rows:
+        if tr[0]:
+            tags = json.loads(tr[0])
+            for tag in tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+    # Top tags
+    top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    return {
+        "workspace": workspace,
+        "exists": True,
+        "total_memories": row[0],
+        "daily_memories": row[1] or 0,
+        "permanent_memories": row[2] or 0,
+        "first_memory": row[3],
+        "last_memory": row[4],
+        "avg_importance": round(row[5], 3) if row[5] else 1.0,
+        "top_tags": [{"tag": t[0], "count": t[1]} for t in top_tags],
+    }
+
+
+def move_memories_to_workspace(
+    conn: sqlite3.Connection,
+    memory_ids: List[int],
+    target_workspace: str,
+) -> Dict[str, Any]:
+    """
+    Move memories to a different workspace.
+
+    Args:
+        conn: Database connection
+        memory_ids: List of memory IDs to move
+        target_workspace: Destination workspace
+
+    Returns:
+        Dictionary with move results
+    """
+    _ensure_workspace_column(conn)
+
+    if not memory_ids:
+        return {"moved": 0, "not_found": []}
+
+    placeholders = ",".join("?" * len(memory_ids))
+
+    # Check which IDs exist
+    existing = conn.execute(
+        f"SELECT id FROM memories WHERE id IN ({placeholders})",
+        memory_ids,
+    ).fetchall()
+    existing_ids = {row[0] for row in existing}
+    not_found = [mid for mid in memory_ids if mid not in existing_ids]
+
+    # Update workspace for existing memories
+    if existing_ids:
+        existing_list = list(existing_ids)
+        existing_placeholders = ",".join("?" * len(existing_list))
+        sync_version = _get_next_sync_version(conn)
+        cur = conn.execute(
+            f"""
+            UPDATE memories
+            SET workspace = ?, sync_version = ?
+            WHERE id IN ({existing_placeholders})
+            """,
+            [target_workspace, sync_version] + existing_list,
+        )
+        conn.commit()
+        moved = cur.rowcount
+    else:
+        moved = 0
+
+    return {
+        "moved": moved,
+        "target_workspace": target_workspace,
+        "not_found": not_found,
+    }
+
+
+def delete_workspace(
+    conn: sqlite3.Connection,
+    workspace: str,
+    delete_memories: bool = False,
+) -> Dict[str, Any]:
+    """
+    Delete a workspace. Optionally delete all memories in it.
+
+    Args:
+        conn: Database connection
+        workspace: Workspace to delete
+        delete_memories: If True, delete all memories. If False, move to default.
+
+    Returns:
+        Dictionary with deletion results
+    """
+    _ensure_workspace_column(conn)
+
+    if workspace == DEFAULT_WORKSPACE:
+        return {
+            "error": "cannot_delete_default",
+            "message": "Cannot delete the default workspace",
+        }
+
+    # Count memories in workspace
+    count = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE workspace = ?",
+        (workspace,),
+    ).fetchone()[0]
+
+    if delete_memories:
+        # Delete all memories in workspace
+        ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM memories WHERE workspace = ?", (workspace,)
+            ).fetchall()
+        ]
+
+        deleted_memories = 0
+        for memory_id in ids:
+            if delete_memory(conn, memory_id):
+                deleted_memories += 1
+
+        return {
+            "workspace": workspace,
+            "deleted": True,
+            "memories_deleted": deleted_memories,
+        }
+
+    # Move memories to default workspace
+    if count:
+        sync_version = _get_next_sync_version(conn)
+        conn.execute(
+            "UPDATE memories SET workspace = ?, sync_version = ? WHERE workspace = ?",
+            (DEFAULT_WORKSPACE, sync_version, workspace),
+        )
+        conn.commit()
+
+    return {
+        "workspace": workspace,
+        "deleted": True,
+        "memories_moved_to_default": count,
+    }

@@ -4,6 +4,7 @@ This module provides a backend system that allows memora to transparently
 use different storage backends (local SQLite, cloud-synced SQLite, etc.) while
 keeping the same API surface.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +13,6 @@ import logging
 import os
 import shutil
 import sqlite3
-import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -27,8 +27,12 @@ except ImportError:
 
 try:
     import boto3
-    from botocore.exceptions import ClientError, NoCredentialsError, EndpointConnectionError
     from botocore.config import Config as BotoConfig
+    from botocore.exceptions import (
+        ClientError,
+        EndpointConnectionError,
+        NoCredentialsError,
+    )
 except ImportError:
     boto3 = None
     ClientError = None
@@ -46,10 +50,16 @@ SYNC_CHECK_TTL = 30.0  # seconds - skip HEAD request if we checked recently
 
 # Transient error codes that should trigger retry
 TRANSIENT_ERROR_CODES = {
-    "500", "502", "503", "504",  # Server errors
-    "RequestTimeout", "RequestTimeoutException",
-    "ThrottlingException", "Throttling",
-    "SlowDown", "ServiceUnavailable",
+    "500",
+    "502",
+    "503",
+    "504",  # Server errors
+    "RequestTimeout",
+    "RequestTimeoutException",
+    "ThrottlingException",
+    "Throttling",
+    "SlowDown",
+    "ServiceUnavailable",
     "InternalError",
 }
 
@@ -164,8 +174,7 @@ def _retry_with_backoff(func, operation: str, max_retries: int = MAX_RETRIES):
 
             # Calculate delay with exponential backoff + jitter
             delay = min(
-                RETRY_BASE_DELAY * (2 ** attempt) + (time.time() % 1),
-                RETRY_MAX_DELAY
+                RETRY_BASE_DELAY * (2**attempt) + (time.time() % 1), RETRY_MAX_DELAY
             )
             logger.warning(
                 f"Transient error during {operation} (attempt {attempt + 1}/{max_retries + 1}), "
@@ -179,6 +188,7 @@ def _retry_with_backoff(func, operation: str, max_retries: int = MAX_RETRIES):
 
 class ConflictError(Exception):
     """Raised when a cloud sync conflict is detected (concurrent modification)."""
+
     pass
 
 
@@ -291,8 +301,7 @@ class CloudSQLiteBackend(StorageBackend):
         """
         if boto3 is None:
             raise ImportError(
-                "boto3 is required for cloud storage. "
-                "Install with: pip install boto3"
+                "boto3 is required for cloud storage. Install with: pip install boto3"
             )
 
         if filelock is None:
@@ -316,7 +325,9 @@ class CloudSQLiteBackend(StorageBackend):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Create a unique cache path based on bucket + key
-        cache_key = hashlib.sha256(f"{self.bucket}/{self.key}".encode()).hexdigest()[:16]
+        cache_key = hashlib.sha256(f"{self.bucket}/{self.key}".encode()).hexdigest()[
+            :16
+        ]
         self.cache_path = self.cache_dir / cache_key / "memories.db"
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -396,7 +407,9 @@ class CloudSQLiteBackend(StorageBackend):
 
         This is called when the remote database doesn't exist yet (first-time setup).
         """
-        logger.info(f"Creating empty database and uploading to {self.bucket}/{self.key}")
+        logger.info(
+            f"Creating empty database and uploading to {self.bucket}/{self.key}"
+        )
 
         # Create empty local database with schema
         # Import here to avoid circular imports
@@ -418,20 +431,19 @@ class CloudSQLiteBackend(StorageBackend):
             str(self.cache_path),
             self.bucket,
             self.key,
-            ExtraArgs=extra_args if extra_args else None
+            ExtraArgs=extra_args if extra_args else None,
         )
 
         # Get the ETag of the uploaded file
-        head_response = self.s3_client.head_object(
-            Bucket=self.bucket,
-            Key=self.key
-        )
+        head_response = self.s3_client.head_object(Bucket=self.bucket, Key=self.key)
 
         # Save metadata
         metadata = {
             "etag": head_response.get("ETag", "").strip('"'),
             "last_sync": datetime.now().isoformat(),
-            "remote_modified": head_response.get("LastModified").isoformat() if head_response.get("LastModified") else None,
+            "remote_modified": head_response.get("LastModified").isoformat()
+            if head_response.get("LastModified")
+            else None,
         }
         self._save_metadata(metadata)
 
@@ -483,10 +495,9 @@ class CloudSQLiteBackend(StorageBackend):
                 try:
                     head_response = _retry_with_backoff(
                         lambda: self.s3_client.head_object(
-                            Bucket=self.bucket,
-                            Key=self.key
+                            Bucket=self.bucket, Key=self.key
                         ),
-                        "checking remote database"
+                        "checking remote database",
                     )
                     remote_etag = head_response.get("ETag", "").strip('"')
                     remote_modified = head_response.get("LastModified")
@@ -529,7 +540,9 @@ class CloudSQLiteBackend(StorageBackend):
                     return
 
                 # Download from S3 with retry
-                logger.info(f"Downloading {self.bucket}/{self.key} to {self.cache_path}")
+                logger.info(
+                    f"Downloading {self.bucket}/{self.key} to {self.cache_path}"
+                )
                 start_time = time.time()
 
                 # Download to temporary file first
@@ -539,7 +552,7 @@ class CloudSQLiteBackend(StorageBackend):
                     lambda: self.s3_client.download_file(
                         self.bucket, self.key, str(temp_path)
                     ),
-                    "downloading database"
+                    "downloading database",
                 )
 
                 # Move to final location
@@ -552,7 +565,9 @@ class CloudSQLiteBackend(StorageBackend):
                 # Update metadata
                 metadata["etag"] = remote_etag
                 metadata["last_sync"] = datetime.now().isoformat()
-                metadata["remote_modified"] = remote_modified.isoformat() if remote_modified else None
+                metadata["remote_modified"] = (
+                    remote_modified.isoformat() if remote_modified else None
+                )
                 self._save_metadata(metadata)
 
                 # Update hash and sync check time
@@ -587,7 +602,9 @@ class CloudSQLiteBackend(StorageBackend):
             try:
                 # Double-check dirty flag under lock
                 if not self._is_dirty:
-                    logger.debug("Database not dirty (checked under lock), skipping sync")
+                    logger.debug(
+                        "Database not dirty (checked under lock), skipping sync"
+                    )
                     return
 
                 if not self.cache_path.exists():
@@ -612,10 +629,9 @@ class CloudSQLiteBackend(StorageBackend):
                     try:
                         current_remote = _retry_with_backoff(
                             lambda: self.s3_client.head_object(
-                                Bucket=self.bucket,
-                                Key=self.key
+                                Bucket=self.bucket, Key=self.key
                             ),
-                            "checking remote state before upload"
+                            "checking remote state before upload",
                         )
                         current_remote_etag = current_remote.get("ETag", "").strip('"')
 
@@ -647,9 +663,9 @@ class CloudSQLiteBackend(StorageBackend):
                         str(self.cache_path),
                         self.bucket,
                         self.key,
-                        ExtraArgs=extra_args if extra_args else None
+                        ExtraArgs=extra_args if extra_args else None,
                     ),
-                    "uploading database"
+                    "uploading database",
                 )
 
                 duration = time.time() - start_time
@@ -659,15 +675,16 @@ class CloudSQLiteBackend(StorageBackend):
                 # Update metadata with new remote state
                 head_response = _retry_with_backoff(
                     lambda: self.s3_client.head_object(
-                        Bucket=self.bucket,
-                        Key=self.key
+                        Bucket=self.bucket, Key=self.key
                     ),
-                    "verifying upload"
+                    "verifying upload",
                 )
                 metadata = {
                     "etag": head_response.get("ETag", "").strip('"'),
                     "last_sync": datetime.now().isoformat(),
-                    "remote_modified": head_response.get("LastModified").isoformat() if head_response.get("LastModified") else None,
+                    "remote_modified": head_response.get("LastModified").isoformat()
+                    if head_response.get("LastModified")
+                    else None,
                 }
                 self._save_metadata(metadata)
 
@@ -716,12 +733,14 @@ class CloudSQLiteBackend(StorageBackend):
 
             def __getattr__(self, name):
                 attr = getattr(self._conn, name)
-                if name == 'commit':
+                if name == "commit":
+
                     def wrapped_commit(*args, **kwargs):
                         result = attr(*args, **kwargs)
                         self._backend._is_dirty = True
                         logger.debug("Database marked as dirty after commit")
                         return result
+
                     return wrapped_commit
                 return attr
 
@@ -743,7 +762,9 @@ class CloudSQLiteBackend(StorageBackend):
             "key": self.key,
             "cache_path": str(self.cache_path),
             "cache_exists": self.cache_path.exists(),
-            "cache_size_bytes": self.cache_path.stat().st_size if self.cache_path.exists() else 0,
+            "cache_size_bytes": self.cache_path.stat().st_size
+            if self.cache_path.exists()
+            else 0,
             "is_dirty": self._is_dirty,
             "last_etag": metadata.get("etag"),
             "last_sync": metadata.get("last_sync"),
@@ -755,6 +776,8 @@ class CloudSQLiteBackend(StorageBackend):
         """Force download from cloud, ignoring local state."""
         with self.lock:
             logger.info("Forcing sync pull from cloud")
+            # Reset TTL cache to ensure sync_before_use actually downloads
+            self._last_sync_check = 0.0
             # Clear metadata to force download
             if self.meta_path.exists():
                 self.meta_path.unlink()
@@ -800,13 +823,19 @@ class D1Row:
 class D1Cursor:
     """A cursor-like object for D1 query results."""
 
-    def __init__(self, results: list, columns: list, lastrowid: int = 0, rowcount: int = 0):
+    def __init__(
+        self, results: list, columns: list, lastrowid: int = 0, rowcount: int = 0
+    ):
         self._results = results
         self._columns = columns
         self._index = 0
         self.lastrowid = lastrowid
         self.rowcount = rowcount
-        self.description = [(col, None, None, None, None, None, None) for col in columns] if columns else None
+        self.description = (
+            [(col, None, None, None, None, None, None) for col in columns]
+            if columns
+            else None
+        )
 
     def fetchone(self):
         if self._index >= len(self._results):
@@ -816,14 +845,14 @@ class D1Cursor:
         return D1Row(row, self._columns)
 
     def fetchall(self):
-        rows = self._results[self._index:]
+        rows = self._results[self._index :]
         self._index = len(self._results)
         return [D1Row(row, self._columns) for row in rows]
 
     def fetchmany(self, size=None):
         if size is None:
             size = 1
-        rows = self._results[self._index:self._index + size]
+        rows = self._results[self._index : self._index + size]
         self._index += len(rows)
         return [D1Row(row, self._columns) for row in rows]
 
@@ -857,8 +886,8 @@ class D1Connection:
 
     def _execute_api(self, sql: str, params: tuple = None) -> dict:
         """Execute SQL via D1 HTTP API with session affinity for read-your-writes."""
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         url = f"{self.base_url}/query"
 
@@ -940,7 +969,9 @@ class D1Connection:
             lastrowid = meta.get("last_row_id", lastrowid)
             total_changes += meta.get("changes", 0)
 
-        return D1Cursor(results=[], columns=[], lastrowid=lastrowid, rowcount=total_changes)
+        return D1Cursor(
+            results=[], columns=[], lastrowid=lastrowid, rowcount=total_changes
+        )
 
     def executescript(self, sql_script: str) -> D1Cursor:
         """Execute multiple SQL statements separated by semicolons."""
@@ -956,7 +987,9 @@ class D1Connection:
             lastrowid = meta.get("last_row_id", lastrowid)
             total_changes += meta.get("changes", 0)
 
-        return D1Cursor(results=[], columns=[], lastrowid=lastrowid, rowcount=total_changes)
+        return D1Cursor(
+            results=[], columns=[], lastrowid=lastrowid, rowcount=total_changes
+        )
 
     def cursor(self) -> "D1Connection":
         """Return self as cursor (D1Connection acts as both)."""
@@ -1046,8 +1079,7 @@ def parse_backend_uri(uri: str) -> StorageBackend:
         parts = uri[5:].split("/", 1)
         if len(parts) != 2:
             raise ValueError(
-                f"Invalid D1 URI format: {uri}\n"
-                "Expected: d1://account_id/database_id"
+                f"Invalid D1 URI format: {uri}\nExpected: d1://account_id/database_id"
             )
 
         account_id, database_id = parts
@@ -1060,12 +1092,18 @@ def parse_backend_uri(uri: str) -> StorageBackend:
                 "Required permissions: D1 Edit"
             )
 
-        return D1Backend(account_id=account_id, database_id=database_id, api_token=api_token)
+        return D1Backend(
+            account_id=account_id, database_id=database_id, api_token=api_token
+        )
 
     elif uri.startswith("s3://"):
         # Parse cloud storage options from environment
         encrypt = os.getenv("MEMORA_CLOUD_ENCRYPT", "").lower() in ("1", "true", "yes")
-        compress = os.getenv("MEMORA_CLOUD_COMPRESS", "").lower() in ("1", "true", "yes")
+        compress = os.getenv("MEMORA_CLOUD_COMPRESS", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         cache_dir_env = os.getenv("MEMORA_CACHE_DIR")
         cache_dir = Path(cache_dir_env) if cache_dir_env else None
 
