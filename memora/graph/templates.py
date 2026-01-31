@@ -347,7 +347,7 @@ function toggleSection(el) {
 }
 
 function filterByDuplicates() {
-    document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.legend-item, .section-item, .subsection-item, .cluster-item').forEach(el => el.classList.remove('active'));
     var el = document.querySelector('#duplicates-legend .legend-item');
     if (el) el.classList.add('active');
     currentFilter = 'duplicates';
@@ -356,7 +356,7 @@ function filterByDuplicates() {
 }
 
 function filterByTag(tag) {
-    document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.legend-item, .section-item, .subsection-item, .cluster-item').forEach(el => el.classList.remove('active'));
     var el = document.querySelector('.legend-item[data-tag="' + tag + '"]');
     if (el) el.classList.add('active');
     currentFilter = tag;
@@ -365,7 +365,7 @@ function filterByTag(tag) {
 }
 
 function filterBySection(section) {
-    document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.legend-item, .section-item, .subsection-item, .cluster-item').forEach(el => el.classList.remove('active'));
     var el = document.querySelector('.section-item[data-section="' + section + '"]');
     if (el) el.classList.add('active');
     currentFilter = section;
@@ -374,7 +374,7 @@ function filterBySection(section) {
 }
 
 function filterBySubsection(subsection) {
-    document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.legend-item, .section-item, .subsection-item, .cluster-item').forEach(el => el.classList.remove('active'));
     var el = document.querySelector('.subsection-item[data-subsection="' + subsection + '"]');
     if (el) el.classList.add('active');
     currentFilter = subsection;
@@ -396,7 +396,7 @@ function applyFilter(nodeIds) {
 }
 
 function resetFilter() {
-    document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.legend-item, .section-item, .subsection-item, .cluster-item').forEach(el => el.classList.remove('active'));
     currentFilter = null;
     exitFocusMode();
     var sourceNodes = typeof graphData !== 'undefined' ? graphData.nodes : allNodes;
@@ -945,19 +945,168 @@ function showPanel(mem) {
 """
 
 
+CLUSTER_CSS = """
+"""
+
+CLUSTER_JS = """
+function computeConvexHull(points) {
+    if (points.length <= 1) return points;
+    points.sort(function(a, b) { return a.x - b.x || a.y - b.y; });
+    if (points.length <= 2) return points.slice();
+
+    var lower = [];
+    for (var i = 0; i < points.length; i++) {
+        while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], points[i]) <= 0)
+            lower.pop();
+        lower.push(points[i]);
+    }
+    var upper = [];
+    for (var i = points.length - 1; i >= 0; i--) {
+        while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], points[i]) <= 0)
+            upper.pop();
+        upper.push(points[i]);
+    }
+    upper.pop();
+    lower.pop();
+    return lower.concat(upper);
+}
+
+function cross(O, A, B) {
+    return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x);
+}
+
+function expandHull(hull, padding) {
+    if (hull.length < 3) return hull;
+    var cx = 0, cy = 0;
+    for (var i = 0; i < hull.length; i++) { cx += hull[i].x; cy += hull[i].y; }
+    cx /= hull.length; cy /= hull.length;
+    var expanded = [];
+    for (var i = 0; i < hull.length; i++) {
+        var dx = hull[i].x - cx, dy = hull[i].y - cy;
+        var dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist === 0) { expanded.push({x: hull[i].x, y: hull[i].y}); continue; }
+        expanded.push({x: hull[i].x + dx/dist * padding, y: hull[i].y + dy/dist * padding});
+    }
+    return expanded;
+}
+
+function drawSmoothClosed(ctx, hull) {
+    // Draw a smooth closed curve through hull points using Catmull-Rom splines
+    var n = hull.length;
+    if (n < 3) return;
+    ctx.beginPath();
+    for (var i = 0; i < n; i++) {
+        var p0 = hull[(i - 1 + n) % n];
+        var p1 = hull[i];
+        var p2 = hull[(i + 1) % n];
+        var p3 = hull[(i + 2) % n];
+        // Catmull-Rom to cubic bezier conversion (alpha=0.5 centripetal)
+        var tension = 6;
+        var cp1x = p1.x + (p2.x - p0.x) / tension;
+        var cp1y = p1.y + (p2.y - p0.y) / tension;
+        var cp2x = p2.x - (p3.x - p1.x) / tension;
+        var cp2y = p2.y - (p3.y - p1.y) / tension;
+        if (i === 0) ctx.moveTo(p1.x, p1.y);
+        ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+    }
+    ctx.closePath();
+}
+
+function drawClusterHulls(ctx) {
+    var clusterToNodes = (typeof graphData !== 'undefined' && graphData) ? graphData.clusterToNodes : (typeof window.clusterToNodes !== 'undefined' ? window.clusterToNodes : {});
+    var clusterColors = (typeof graphData !== 'undefined' && graphData) ? graphData.clusterColors : (typeof window.clusterColors !== 'undefined' ? window.clusterColors : {});
+    if (!clusterToNodes || !clusterColors) return;
+
+    for (var cid in clusterToNodes) {
+        var memberIds = clusterToNodes[cid];
+        if (!memberIds || memberIds.length < 3) continue;
+
+        var positions = network.getPositions(memberIds);
+        var points = [];
+        for (var id of memberIds) {
+            if (positions[id]) points.push({x: positions[id].x, y: positions[id].y});
+        }
+        if (points.length < 3) continue;
+
+        var hull = computeConvexHull(points);
+        if (hull.length < 3) continue;
+        hull = expandHull(hull, 45);
+
+        var color = clusterColors[cid] || '#8b949e';
+        ctx.save();
+
+        // Draw smooth curved boundary
+        drawSmoothClosed(ctx, hull);
+
+        // Fill with low alpha
+        ctx.fillStyle = color + '14';
+        ctx.fill();
+
+        // Stroke with smooth line
+        ctx.strokeStyle = color + '55';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.restore();
+    }
+}
+
+function seedClusterPositions(nodeArray) {
+    // Assign initial (x,y) to nodes grouped by cluster so physics starts clustered
+    var clusterToNodes = (typeof graphData !== 'undefined' && graphData) ? graphData.clusterToNodes : (typeof window.clusterToNodes !== 'undefined' ? window.clusterToNodes : {});
+    if (!clusterToNodes || Object.keys(clusterToNodes).length === 0) return;
+
+    var clusterIds = Object.keys(clusterToNodes);
+    var nClusters = clusterIds.length;
+    // Lay out cluster centers in a circle
+    var radius = 250 + nClusters * 40;
+    var centers = {};
+    for (var i = 0; i < nClusters; i++) {
+        var angle = (2 * Math.PI * i) / nClusters;
+        centers[clusterIds[i]] = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+    }
+
+    // Build node -> cluster lookup
+    var nodeCluster = {};
+    for (var cid in clusterToNodes) {
+        var members = clusterToNodes[cid];
+        for (var j = 0; j < members.length; j++) {
+            nodeCluster[members[j]] = cid;
+        }
+    }
+
+    // Set initial positions: scatter around cluster center
+    var spread = 80 + Math.sqrt(nodeArray.length) * 8;
+    for (var k = 0; k < nodeArray.length; k++) {
+        var node = nodeArray[k];
+        var cid = nodeCluster[node.id];
+        if (cid && centers[cid]) {
+            node.x = centers[cid].x + (Math.random() - 0.5) * spread;
+            node.y = centers[cid].y + (Math.random() - 0.5) * spread;
+        }
+    }
+}
+
+function initClusterHulls() {
+    var clusterToNodes = (typeof graphData !== 'undefined' && graphData) ? graphData.clusterToNodes : (typeof window.clusterToNodes !== 'undefined' ? window.clusterToNodes : {});
+    if (!clusterToNodes || Object.keys(clusterToNodes).length === 0) return;
+    network.on('afterDrawing', function(ctx) { drawClusterHulls(ctx); });
+}
+"""
+
+
 def get_full_css() -> str:
     """Get complete CSS including issue and TODO styles."""
-    return BASE_CSS + "\n" + ISSUE_BADGE_CSS + "\n" + TODO_BADGE_CSS
+    return BASE_CSS + "\n" + ISSUE_BADGE_CSS + "\n" + TODO_BADGE_CSS + "\n" + CLUSTER_CSS
 
 
 def get_spa_css() -> str:
     """Get CSS for SPA (dynamic) graph."""
-    return BASE_CSS + "\n" + SPA_CSS + "\n" + ISSUE_BADGE_CSS + "\n" + TODO_BADGE_CSS
+    return BASE_CSS + "\n" + SPA_CSS + "\n" + ISSUE_BADGE_CSS + "\n" + TODO_BADGE_CSS + "\n" + CLUSTER_CSS
 
 
 def get_full_js() -> str:
     """Get complete JavaScript for graph functionality."""
-    return "\n".join([RENDER_JS, FILTER_JS, ISSUE_FILTER_JS, TODO_FILTER_JS, TOOLTIP_JS, PANEL_JS, RESIZE_JS, TIMELINE_JS])
+    return "\n".join([RENDER_JS, FILTER_JS, ISSUE_FILTER_JS, TODO_FILTER_JS, TOOLTIP_JS, PANEL_JS, RESIZE_JS, TIMELINE_JS, CLUSTER_JS])
 
 
 def build_static_html(
@@ -980,6 +1129,9 @@ def build_static_html(
     min_date: str = "",
     max_date: str = "",
     version: str = "",
+    cluster_to_nodes_json: str = "{}",
+    cluster_colors_json: str = "{}",
+    cluster_meta_json: str = "{}",
 ) -> str:
     """Build complete static HTML for export."""
     css = get_full_css()
@@ -1052,6 +1204,9 @@ Duplicates ({len(duplicate_ids)})</div></div>'''
         var todoCategoryToNodes = {todo_category_to_nodes_json};
         var duplicateIds = {duplicate_ids_json};
         var duplicateSet = new Set(duplicateIds);
+        var clusterToNodes = {cluster_to_nodes_json};
+        var clusterColors = {cluster_colors_json};
+        var clusterMeta = {cluster_meta_json};
         var allNodes = {nodes_json};
         var allEdges = {edges_json}.map(function(e) {{
             // Color edges between duplicates red
@@ -1061,11 +1216,16 @@ Duplicates ({len(duplicate_ids)})</div></div>'''
             return e;
         }});
         var currentFilter = null;
-        var graphData = {{ nodes: allNodes, edges: allEdges, statusToNodes: statusToNodes, issueCategoryToNodes: issueCategoryToNodes, todoStatusToNodes: todoStatusToNodes, todoCategoryToNodes: todoCategoryToNodes, duplicateIds: duplicateIds }};
+        var graphData = {{ nodes: allNodes, edges: allEdges, statusToNodes: statusToNodes, issueCategoryToNodes: issueCategoryToNodes, todoStatusToNodes: todoStatusToNodes, todoCategoryToNodes: todoCategoryToNodes, duplicateIds: duplicateIds, clusterToNodes: clusterToNodes, clusterColors: clusterColors, clusterMeta: clusterMeta }};
+        // Show clusters panel if data exists
+        if (Object.keys(clusterToNodes).length > 0) {{
+            document.getElementById('clusters').style.display = '';
+        }}
 
         {js}
 
         // Initialize graph
+        seedClusterPositions(allNodes);
         var nodes = new vis.DataSet(allNodes);
         var edges = new vis.DataSet(allEdges);
         var container = document.getElementById("graph");
@@ -1098,6 +1258,9 @@ Duplicates ({len(duplicate_ids)})</div></div>'''
         // Initialize timeline
         var nodeTimestamps = {node_timestamps_json};
         initTimeline(nodeTimestamps, "{min_date}", "{max_date}");
+
+        // Initialize cluster hulls
+        initClusterHulls();
     </script>
 </body>
 </html>'''
@@ -1280,7 +1443,8 @@ def get_spa_html(version: str = "") -> str:
             }}
             document.getElementById('section-items').innerHTML = sectionsHtml;
 
-            // Init vis.js
+            // Init vis.js — seed positions so clusters start grouped
+            seedClusterPositions(graphData.nodes);
             nodes = new vis.DataSet(graphData.nodes);
             // Color edges between duplicates red
             var duplicateSet = new Set(graphData.duplicateIds || []);
@@ -1321,6 +1485,9 @@ def get_spa_html(version: str = "") -> str:
             network.on('blurNode', function() {{
                 hideNodeTooltip();
             }});
+
+            // Build cluster legend
+            initClusterHulls();
 
             // Initialize timeline if data is available
             if (graphData.nodeTimestamps && graphData.minDate && graphData.maxDate) {{
@@ -1448,6 +1615,9 @@ def get_spa_html(version: str = "") -> str:
                 }}
             }}
             document.getElementById('section-items').innerHTML = sectionsHtml;
+
+            // Rebuild clusters
+            initClusterHulls();
         }}
 
         function connectSSE() {{

@@ -1151,8 +1151,8 @@ def _remove_link(conn, from_id: int, to_id: int, bidirectional: bool):
 
 
 @_with_connection
-def _detect_clusters(conn, min_cluster_size: int, min_score: float):
-    return detect_clusters(conn, min_cluster_size, min_score)
+def _detect_clusters(conn, min_cluster_size: int, min_score: float, algorithm: str = "connected_components"):
+    return detect_clusters(conn, min_cluster_size, min_score, algorithm)
 
 
 @mcp.tool()
@@ -1212,20 +1212,20 @@ async def memory_unlink(
 async def memory_clusters(
     min_cluster_size: int = 2,
     min_score: float = 0.3,
+    algorithm: str = "connected_components",
 ) -> Dict[str, Any]:
     """Detect clusters of related memories.
-
-    Uses connected components algorithm to find groups of memories
-    that are linked together through cross-references.
 
     Args:
         min_cluster_size: Minimum memories to form a cluster (default: 2)
         min_score: Minimum similarity score to consider connected (default: 0.3)
+        algorithm: "connected_components" (default) or "louvain"
+                   Louvain uses embedding similarity for content-based clustering.
 
     Returns:
         List of clusters with member IDs, sizes, and common tags
     """
-    clusters = _detect_clusters(min_cluster_size, min_score)
+    clusters = _detect_clusters(min_cluster_size, min_score, algorithm)
     return {
         "count": len(clusters),
         "clusters": clusters,
