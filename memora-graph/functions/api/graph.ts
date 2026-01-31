@@ -296,15 +296,19 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
 
   const memories = memoriesResult.results;
 
-  // Fetch all crossrefs
-  const crossrefsResult = await db.prepare(
-    "SELECT memory_id, related FROM memories_crossrefs"
-  ).all<CrossRef>();
-
+  // Fetch all crossrefs (table may not exist on some D1 databases)
   const crossrefsMap = new Map<number, Array<{ id: number; score: number }>>();
-  for (const cr of crossrefsResult.results || []) {
-    const related = parseJson<Array<{ id: number; score: number }>>(cr.related, []);
-    crossrefsMap.set(cr.memory_id, related);
+  try {
+    const crossrefsResult = await db.prepare(
+      "SELECT memory_id, related FROM memories_crossrefs"
+    ).all<CrossRef>();
+
+    for (const cr of crossrefsResult.results || []) {
+      const related = parseJson<Array<{ id: number; score: number }>>(cr.related, []);
+      crossrefsMap.set(cr.memory_id, related);
+    }
+  } catch {
+    // Table doesn't exist yet — proceed without crossrefs
   }
 
   // Build edges

@@ -64,20 +64,24 @@ def _do_sync() -> None:
 
 def _broadcast_update() -> None:
     """Notify connected WebSocket clients of an update."""
+    import sys
     try:
         url = f"{_get_worker_url()}/broadcast"
         req = Request(
             url,
             data=json.dumps({}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "memora-sync/1.0",
+            },
             method="POST",
         )
-        with urlopen(req, timeout=5):
-            pass  # Broadcast successful
-    except URLError:
-        pass  # Ignore broadcast failures
-    except Exception:
-        pass  # Ignore broadcast errors
+        with urlopen(req, timeout=5) as resp:
+            print(f"[memora] Cloud graph broadcast OK ({resp.status})", file=sys.stderr)
+    except URLError as e:
+        print(f"[memora] Cloud graph broadcast failed: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"[memora] Cloud graph broadcast error: {e}", file=sys.stderr)
 
 
 def schedule_sync() -> None:
