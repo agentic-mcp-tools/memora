@@ -1162,6 +1162,137 @@ div.vis-tooltip {
             }
         }
 
+        // Cluster visualization functions
+        function computeConvexHull(points) {
+            if (points.length <= 1) return points;
+            points.sort(function(a, b) { return a.x - b.x || a.y - b.y; });
+            if (points.length <= 2) return points.slice();
+            var lower = [];
+            for (var i = 0; i < points.length; i++) {
+                while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], points[i]) <= 0)
+                    lower.pop();
+                lower.push(points[i]);
+            }
+            var upper = [];
+            for (var i = points.length - 1; i >= 0; i--) {
+                while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], points[i]) <= 0)
+                    upper.pop();
+                upper.push(points[i]);
+            }
+            upper.pop();
+            lower.pop();
+            return lower.concat(upper);
+        }
+
+        function cross(O, A, B) {
+            return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x);
+        }
+
+        function expandHull(hull, padding) {
+            if (hull.length < 3) return hull;
+            var cx = 0, cy = 0;
+            for (var i = 0; i < hull.length; i++) { cx += hull[i].x; cy += hull[i].y; }
+            cx /= hull.length; cy /= hull.length;
+            var expanded = [];
+            for (var i = 0; i < hull.length; i++) {
+                var dx = hull[i].x - cx, dy = hull[i].y - cy;
+                var dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist === 0) { expanded.push({x: hull[i].x, y: hull[i].y}); continue; }
+                expanded.push({x: hull[i].x + dx/dist * padding, y: hull[i].y + dy/dist * padding});
+            }
+            return expanded;
+        }
+
+        function drawSmoothClosed(ctx, hull) {
+            var n = hull.length;
+            if (n < 3) return;
+            ctx.beginPath();
+            for (var i = 0; i < n; i++) {
+                var p0 = hull[(i - 1 + n) % n];
+                var p1 = hull[i];
+                var p2 = hull[(i + 1) % n];
+                var p3 = hull[(i + 2) % n];
+                var tension = 6;
+                var cp1x = p1.x + (p2.x - p0.x) / tension;
+                var cp1y = p1.y + (p2.y - p0.y) / tension;
+                var cp2x = p2.x - (p3.x - p1.x) / tension;
+                var cp2y = p2.y - (p3.y - p1.y) / tension;
+                if (i === 0) ctx.moveTo(p1.x, p1.y);
+                ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+            }
+            ctx.closePath();
+        }
+
+        function drawClusterHulls(ctx) {
+            var clusterToNodes = graphData ? graphData.clusterToNodes : {};
+            var clusterColors = graphData ? graphData.clusterColors : {};
+            if (!clusterToNodes || !clusterColors) return;
+
+            for (var cid in clusterToNodes) {
+                var memberIds = clusterToNodes[cid];
+                if (!memberIds || memberIds.length < 3) continue;
+
+                var positions = network.getPositions(memberIds);
+                var points = [];
+                for (var id of memberIds) {
+                    if (positions[id]) points.push({x: positions[id].x, y: positions[id].y});
+                }
+                if (points.length < 3) continue;
+
+                var hull = computeConvexHull(points);
+                if (hull.length < 3) continue;
+                hull = expandHull(hull, 45);
+
+                var color = clusterColors[cid] || '#8b949e';
+                ctx.save();
+                drawSmoothClosed(ctx, hull);
+                ctx.fillStyle = color + '14';
+                ctx.fill();
+                ctx.strokeStyle = color + '55';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                ctx.restore();
+            }
+        }
+
+        function seedClusterPositions(nodeArray) {
+            var clusterToNodes = graphData ? graphData.clusterToNodes : {};
+            if (!clusterToNodes || Object.keys(clusterToNodes).length === 0) return;
+
+            var clusterIds = Object.keys(clusterToNodes);
+            var nClusters = clusterIds.length;
+            var radius = 250 + nClusters * 40;
+            var centers = {};
+            for (var i = 0; i < nClusters; i++) {
+                var angle = (2 * Math.PI * i) / nClusters;
+                centers[clusterIds[i]] = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+            }
+
+            var nodeCluster = {};
+            for (var cid in clusterToNodes) {
+                var members = clusterToNodes[cid];
+                for (var j = 0; j < members.length; j++) {
+                    nodeCluster[members[j]] = cid;
+                }
+            }
+
+            var spread = 80 + Math.sqrt(nodeArray.length) * 8;
+            for (var k = 0; k < nodeArray.length; k++) {
+                var node = nodeArray[k];
+                var cid = nodeCluster[node.id];
+                if (cid && centers[cid]) {
+                    node.x = centers[cid].x + (Math.random() - 0.5) * spread;
+                    node.y = centers[cid].y + (Math.random() - 0.5) * spread;
+                }
+            }
+        }
+
+        function initClusterHulls() {
+            var clusterToNodes = graphData ? graphData.clusterToNodes : {};
+            if (!clusterToNodes || Object.keys(clusterToNodes).length === 0) return;
+            network.on('afterDrawing', function(ctx) { drawClusterHulls(ctx); });
+        }
+
         function initGraph() {
             document.getElementById('loading').remove();
 
@@ -1263,6 +1394,9 @@ div.vis-tooltip {
             }
             document.getElementById('section-items').innerHTML = sectionsHtml;
 
+            // Seed cluster positions before vis.js init
+            seedClusterPositions(graphData.nodes);
+
             // Init vis.js
             nodes = new vis.DataSet(graphData.nodes);
             // Color edges between duplicates red
@@ -1284,6 +1418,9 @@ div.vis-tooltip {
                 interaction: { hover: true, tooltipDelay: 99999 }
             };
             network = new vis.Network(container, data, options);
+
+            // Init cluster hull overlays
+            initClusterHulls();
 
             network.on('click', async function(params) {
                 hideNodeTooltip();
@@ -1456,6 +1593,7 @@ div.vis-tooltip {
                 });
                 graphData.edges = processedEdges;
 
+                seedClusterPositions(graphData.nodes);
                 nodes.add(graphData.nodes);
                 edges.add(processedEdges);
 

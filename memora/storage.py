@@ -1479,16 +1479,182 @@ def remove_link(
     return {"status": "unlinked", "removed": removed}
 
 
+def _louvain_communities(
+    adj: Dict[int, Dict[int, float]],
+) -> Dict[int, int]:
+    """Louvain community detection on a weighted graph.
+
+    Maximizes modularity by iteratively moving nodes to the community
+    that yields the highest modularity gain, then aggregating.
+
+    Args:
+        adj: Weighted adjacency list {node: {neighbor: weight, ...}, ...}
+
+    Returns:
+        Mapping of original node ID to community ID.
+    """
+    if not adj:
+        return {}
+
+    nodes = list(adj.keys())
+    # community assignment: node -> community
+    node2comm: Dict[int, int] = {n: n for n in nodes}
+
+    # Total weight of all edges (each edge counted once)
+    m2 = 0.0  # 2*m
+    for n in nodes:
+        for w in adj[n].values():
+            m2 += w
+    if m2 == 0.0:
+        return node2comm
+
+    # k_i = sum of weights incident to node i
+    k: Dict[int, float] = {}
+    for n in nodes:
+        k[n] = sum(adj[n].values())
+
+    def _one_level(
+        adj_: Dict[int, Dict[int, float]],
+        node2comm_: Dict[int, int],
+        k_: Dict[int, float],
+        m2_: float,
+    ) -> bool:
+        """One pass of local moves. Returns True if any node moved."""
+        # Sigma_tot: sum of weights incident to community
+        sigma_tot: Dict[int, float] = {}
+        for n in adj_:
+            c = node2comm_[n]
+            sigma_tot[c] = sigma_tot.get(c, 0.0) + k_[n]
+
+        improved = True
+        changed = False
+        while improved:
+            improved = False
+            for n in adj_:
+                c_old = node2comm_[n]
+                k_n = k_[n]
+
+                # Compute k_i_in for current community and neighbor communities
+                comm_weights: Dict[int, float] = {}
+                for nb, w in adj_[n].items():
+                    c_nb = node2comm_[nb]
+                    comm_weights[c_nb] = comm_weights.get(c_nb, 0.0) + w
+
+                k_in_old = comm_weights.get(c_old, 0.0)
+
+                # Remove node from its community
+                sigma_tot[c_old] -= k_n
+
+                best_comm = c_old
+                best_gain = 0.0
+
+                for c_target, k_in_target in comm_weights.items():
+                    # Modularity gain of moving n to c_target
+                    # ΔQ = k_in_target/m - sigma_tot[c_target]*k_n/(2*m^2)
+                    #     - (k_in_old/m - sigma_tot[c_old]*k_n/(2*m^2))
+                    # Simplified (constant terms cancel):
+                    gain = (k_in_target - k_in_old) / m2_ - \
+                           k_n * (sigma_tot.get(c_target, 0.0) - sigma_tot.get(c_old, 0.0)) / (m2_ * m2_)
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_comm = c_target
+
+                # Also consider staying (gain = 0), already handled by best_gain init
+
+                node2comm_[n] = best_comm
+                sigma_tot[best_comm] = sigma_tot.get(best_comm, 0.0) + k_n
+
+                if best_comm != c_old:
+                    improved = True
+                    changed = True
+
+        return changed
+
+    # Phase 1: local moves on original graph
+    _one_level(adj, node2comm, k, m2)
+
+    # Phase 2: aggregate and repeat
+    max_iterations = 20
+    for _ in range(max_iterations):
+        # Build super-graph
+        # Map communities to consecutive IDs
+        comm_set = set(node2comm.values())
+        if len(comm_set) == len(adj):
+            break  # No compression happened
+
+        # Build super-node adjacency
+        super_adj: Dict[int, Dict[int, float]] = {c: {} for c in comm_set}
+        for n in adj:
+            c_n = node2comm[n]
+            for nb, w in adj[n].items():
+                c_nb = node2comm[nb]
+                if c_n != c_nb:
+                    super_adj[c_n][c_nb] = super_adj[c_n].get(c_nb, 0.0) + w
+
+        super_k: Dict[int, float] = {}
+        for c in comm_set:
+            super_k[c] = sum(super_adj[c].values())
+            # Add internal edges weight
+            for n in adj:
+                if node2comm[n] == c:
+                    for nb, w in adj[n].items():
+                        if node2comm[nb] == c:
+                            super_k[c] += w
+
+        super_node2comm: Dict[int, int] = {c: c for c in comm_set}
+        changed = _one_level(super_adj, super_node2comm, super_k, m2)
+
+        if not changed:
+            break
+
+        # Propagate community assignments back to original nodes
+        for n in list(node2comm.keys()):
+            node2comm[n] = super_node2comm.get(node2comm[n], node2comm[n])
+
+    # Renumber communities to 1, 2, 3, ...
+    comm_ids = sorted(set(node2comm.values()))
+    remap = {c: i + 1 for i, c in enumerate(comm_ids)}
+    return {n: remap[c] for n, c in node2comm.items()}
+
+
+def _build_similarity_graph(
+    conn: sqlite3.Connection,
+    memory_ids: List[int],
+    min_score: float = 0.3,
+) -> Dict[int, Dict[int, float]]:
+    """Build weighted adjacency list from embedding cosine similarities.
+
+    Computes pairwise similarity between all memories using their stored
+    embeddings and keeps edges above min_score threshold.
+    """
+    embeddings = _get_embeddings_for_ids(conn, memory_ids)
+    ids_with_emb = [mid for mid in memory_ids if mid in embeddings]
+
+    adj: Dict[int, Dict[int, float]] = {mid: {} for mid in ids_with_emb}
+
+    for i in range(len(ids_with_emb)):
+        for j in range(i + 1, len(ids_with_emb)):
+            a, b = ids_with_emb[i], ids_with_emb[j]
+            score = _cosine_similarity(embeddings[a], embeddings[b])
+            if score >= min_score:
+                adj[a][b] = score
+                adj[b][a] = score
+
+    return adj
+
+
 def detect_clusters(
     conn: sqlite3.Connection,
     min_cluster_size: int = 2,
     min_score: float = 0.3,
+    algorithm: str = "connected_components",
 ) -> List[Dict[str, Any]]:
-    """Detect clusters of related memories using connected components.
+    """Detect clusters of related memories.
 
     Args:
         min_cluster_size: Minimum memories to form a cluster
         min_score: Minimum similarity score to consider as connected
+        algorithm: "connected_components" (default) or "louvain"
 
     Returns:
         List of clusters, each with member IDs and common tags
@@ -1498,41 +1664,54 @@ def detect_clusters(
     memory_ids = {m["id"] for m in all_memories}
     memory_tags = {m["id"]: set(m.get("tags", [])) for m in all_memories}
 
-    # Build graph edges
-    edges: Dict[int, set] = {mid: set() for mid in memory_ids}
-    for memory in all_memories:
-        mid = memory["id"]
-        refs = get_crossrefs(conn, mid)
-        for ref in refs:
-            ref_id = ref.get("id")
-            score = ref.get("score", 0)
-            if ref_id in memory_ids and score >= min_score:
-                edges[mid].add(ref_id)
-                edges[ref_id].add(mid)  # Make bidirectional for clustering
+    if algorithm == "louvain":
+        # Build weighted similarity graph from embeddings
+        adj = _build_similarity_graph(conn, list(memory_ids), min_score)
+        node2comm = _louvain_communities(adj)
 
-    # Find connected components using BFS
-    visited: set = set()
-    clusters: List[List[int]] = []
+        # Group nodes by community
+        comm_members: Dict[int, List[int]] = {}
+        for node_id, comm_id in node2comm.items():
+            if comm_id not in comm_members:
+                comm_members[comm_id] = []
+            comm_members[comm_id].append(node_id)
 
-    for start_id in memory_ids:
-        if start_id in visited:
-            continue
+        clusters = [members for members in comm_members.values()
+                    if len(members) >= min_cluster_size]
+    else:
+        # Original connected components algorithm
+        edges: Dict[int, set] = {mid: set() for mid in memory_ids}
+        for memory in all_memories:
+            mid = memory["id"]
+            refs = get_crossrefs(conn, mid)
+            for ref in refs:
+                ref_id = ref.get("id")
+                score = ref.get("score", 0)
+                if ref_id in memory_ids and score >= min_score:
+                    edges[mid].add(ref_id)
+                    edges[ref_id].add(mid)
 
-        # BFS to find all connected nodes
-        cluster: List[int] = []
-        queue = [start_id]
-        while queue:
-            node = queue.pop(0)
-            if node in visited:
+        visited: set = set()
+        clusters: List[List[int]] = []
+
+        for start_id in memory_ids:
+            if start_id in visited:
                 continue
-            visited.add(node)
-            cluster.append(node)
-            for neighbor in edges[node]:
-                if neighbor not in visited:
-                    queue.append(neighbor)
 
-        if len(cluster) >= min_cluster_size:
-            clusters.append(cluster)
+            cluster: List[int] = []
+            queue = [start_id]
+            while queue:
+                node = queue.pop(0)
+                if node in visited:
+                    continue
+                visited.add(node)
+                cluster.append(node)
+                for neighbor in edges[node]:
+                    if neighbor not in visited:
+                        queue.append(neighbor)
+
+            if len(cluster) >= min_cluster_size:
+                clusters.append(cluster)
 
     # Format clusters with metadata
     result = []
@@ -1990,6 +2169,8 @@ def list_memories(
     order_plain = "created_at DESC"
 
     if query and _fts_enabled(conn):
+        # Sanitize query for FTS5: quote each term to avoid syntax errors
+        fts_query = " ".join(f'"{t}"' for t in query.split() if t)
         # Use full-text search when available. Fall back to LIKE if the query fails.
         try:
             rows = conn.execute(
@@ -2000,21 +2181,32 @@ def list_memories(
                 WHERE f MATCH ?{date_clause_fts}
                 ORDER BY {order_fts}{limit_clause}
                 """,
-                (query, *date_params, *limit_params),
+                (fts_query, *date_params, *limit_params),
             ).fetchall()
         except sqlite3.OperationalError:
             rows = []
     elif query:
-        pattern = f"%{query}%"
-        rows = conn.execute(
-            f"""
-            SELECT {cols_plain}
-            FROM memories
-            WHERE (content LIKE ? OR tags LIKE ? OR metadata LIKE ?){date_clause_plain}
-            ORDER BY {order_plain}{limit_clause}
-            """,
-            (pattern, pattern, pattern, *date_params, *limit_params),
-        ).fetchall()
+        # Search each word individually to avoid LIKE pattern complexity limits
+        words = [w for w in query.split() if w]
+        if words:
+            word_clauses = " AND ".join(
+                "(content LIKE ? OR tags LIKE ? OR metadata LIKE ?)" for _ in words
+            )
+            word_params: list = []
+            for w in words:
+                p = f"%{w}%"
+                word_params.extend([p, p, p])
+            rows = conn.execute(
+                f"""
+                SELECT {cols_plain}
+                FROM memories
+                WHERE ({word_clauses}){date_clause_plain}
+                ORDER BY {order_plain}{limit_clause}
+                """,
+                (*word_params, *date_params, *limit_params),
+            ).fetchall()
+        else:
+            rows = []
     else:
         where_clause = " WHERE 1=1" + date_clause_plain if date_clause_plain else ""
         rows = conn.execute(
@@ -2025,16 +2217,27 @@ def list_memories(
     # If the FTS search yielded nothing because of an SQLite error (e.g. malformed query)
     # fall back to a LIKE search for resilience.
     if query and _fts_enabled(conn) and not rows:
-        pattern = f"%{query}%"
-        rows = conn.execute(
-            f"""
-            SELECT {cols_plain}
-            FROM memories
-            WHERE (content LIKE ? OR tags LIKE ? OR metadata LIKE ?){date_clause_plain}
-            ORDER BY {order_plain}{limit_clause}
-            """,
-            (pattern, pattern, pattern, *date_params, *limit_params),
-        ).fetchall()
+        words = [w for w in query.split() if w]
+        if words:
+            word_clauses = " ".join(
+                "AND (content LIKE ? OR tags LIKE ? OR metadata LIKE ?)" for _ in words
+            )
+            word_params_fb: list = []
+            for w in words:
+                p = f"%{w}%"
+                word_params_fb.extend([p, p, p])
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT {cols_plain}
+                    FROM memories
+                    WHERE 1=1 {word_clauses}{date_clause_plain}
+                    ORDER BY {order_plain}{limit_clause}
+                    """,
+                    (*word_params_fb, *date_params, *limit_params),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
 
     records: List[Dict[str, Any]] = []
     for row in rows:

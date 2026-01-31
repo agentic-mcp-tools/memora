@@ -70,6 +70,170 @@ const TODO_STATUS_COLORS: Record<string, string> = {
 
 const DUPLICATE_THRESHOLD = 0.85;
 
+// Cluster colors (distinct from TAG_COLORS)
+const CLUSTER_COLORS = [
+  "#ff6b6b", "#ffd93d", "#6bcb77", "#4d96ff",
+  "#ff922b", "#cc5de8", "#20c997", "#339af0",
+  "#f06595", "#a9e34b", "#22b8cf", "#845ef7",
+];
+
+function louvainCommunities(
+  adj: Map<number, Map<number, number>>,
+  minCommunitySize: number = 3
+): Map<number, number> {
+  const nodeList = Array.from(adj.keys());
+  if (nodeList.length === 0) return new Map();
+
+  // Initialize: each node in its own community
+  const community = new Map<number, number>();
+  for (const n of nodeList) community.set(n, n);
+
+  // Compute total weight
+  let m2 = 0; // 2*m
+  for (const [, neighbors] of adj) {
+    for (const [, w] of neighbors) m2 += w;
+  }
+  if (m2 === 0) return community;
+
+  // Node strengths (sum of weights)
+  const strength = new Map<number, number>();
+  for (const n of nodeList) {
+    let s = 0;
+    for (const [, w] of adj.get(n)!) s += w;
+    strength.set(n, s);
+  }
+
+  // Phase 1: Local moves
+  let improved = true;
+  let iterations = 0;
+  while (improved && iterations < 50) {
+    improved = false;
+    iterations++;
+
+    for (const node of nodeList) {
+      const currentComm = community.get(node)!;
+      const ki = strength.get(node)!;
+
+      // Sum of weights to each neighboring community
+      const commWeights = new Map<number, number>();
+      for (const [neighbor, w] of adj.get(node)!) {
+        const nc = community.get(neighbor)!;
+        commWeights.set(nc, (commWeights.get(nc) || 0) + w);
+      }
+
+      // Compute community totals
+      const commTotals = new Map<number, number>();
+      for (const n of nodeList) {
+        const c = community.get(n)!;
+        commTotals.set(c, (commTotals.get(c) || 0) + strength.get(n)!);
+      }
+
+      // Weight to own community (excluding self)
+      const kiIn = commWeights.get(currentComm) || 0;
+      const sigmaTot = commTotals.get(currentComm)! - ki;
+
+      // Remove node from current community: compute loss
+      const removeLoss = kiIn / m2 - (sigmaTot * ki) / (m2 * m2);
+
+      let bestGain = 0;
+      let bestComm = currentComm;
+
+      for (const [targetComm, kiTarget] of commWeights) {
+        if (targetComm === currentComm) continue;
+        const sigmaTarget = commTotals.get(targetComm) || 0;
+        const gain = kiTarget / m2 - (sigmaTarget * ki) / (m2 * m2) - removeLoss;
+        if (gain > bestGain) {
+          bestGain = gain;
+          bestComm = targetComm;
+        }
+      }
+
+      if (bestComm !== currentComm) {
+        community.set(node, bestComm);
+        improved = true;
+      }
+    }
+  }
+
+  // Renumber communities starting from 0
+  const uniqueComms = [...new Set(community.values())];
+  const commMap = new Map<number, number>();
+  let idx = 0;
+  for (const c of uniqueComms) {
+    // Count members
+    let count = 0;
+    for (const [, v] of community) {
+      if (v === c) count++;
+    }
+    if (count >= minCommunitySize) {
+      commMap.set(c, idx++);
+    }
+  }
+
+  const result = new Map<number, number>();
+  for (const [node, comm] of community) {
+    if (commMap.has(comm)) {
+      result.set(node, commMap.get(comm)!);
+    }
+  }
+  return result;
+}
+
+function buildClusterData(
+  crossrefsMap: Map<number, Array<{ id: number; score: number }>>,
+  memoryIds: number[],
+  minScore: number = 0.5,
+  minClusterSize: number = 3
+): {
+  clusterToNodes: Record<string, number[]>;
+  clusterColors: Record<string, string>;
+  clusterMeta: Record<string, { size: number; label: string }>;
+} {
+  const empty = { clusterToNodes: {}, clusterColors: {}, clusterMeta: {} };
+  if (memoryIds.length < minClusterSize) return empty;
+
+  const idSet = new Set(memoryIds);
+
+  // Build similarity graph from crossrefs (already computed)
+  const adj = new Map<number, Map<number, number>>();
+  for (const id of memoryIds) adj.set(id, new Map());
+
+  for (const [memId, refs] of crossrefsMap) {
+    if (!idSet.has(memId)) continue;
+    for (const ref of refs) {
+      if (ref.score < minScore || !idSet.has(ref.id)) continue;
+      adj.get(memId)?.set(ref.id, ref.score);
+      adj.get(ref.id)?.set(memId, ref.score);
+    }
+  }
+
+  // Run Louvain
+  const communities = louvainCommunities(adj, minClusterSize);
+
+  // Build cluster mappings
+  const clusterToNodes: Record<string, number[]> = {};
+  for (const [nodeId, clusterId] of communities) {
+    const key = String(clusterId);
+    if (!clusterToNodes[key]) clusterToNodes[key] = [];
+    clusterToNodes[key].push(nodeId);
+  }
+
+  const clusterColors: Record<string, string> = {};
+  const clusterMeta: Record<string, { size: number; label: string }> = {};
+  const clusterIds = Object.keys(clusterToNodes);
+
+  for (let i = 0; i < clusterIds.length; i++) {
+    const cid = clusterIds[i];
+    clusterColors[cid] = CLUSTER_COLORS[i % CLUSTER_COLORS.length];
+    clusterMeta[cid] = {
+      size: clusterToNodes[cid].length,
+      label: `Cluster ${parseInt(cid) + 1}`,
+    };
+  }
+
+  return { clusterToNodes, clusterColors, clusterMeta };
+}
+
 function parseJson<T>(str: string | null, defaultValue: T): T {
   if (!str) return defaultValue;
   try {
@@ -351,6 +515,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     maxDate = dates[dates.length - 1];
   }
 
+  // Build cluster data using Louvain on crossrefs
+  const nodeIds = nodes.map(n => n.id);
+  const clusterData = buildClusterData(crossrefsMap, nodeIds, 0.5, 3);
+
   return Response.json({
     nodes,
     edges,
@@ -366,5 +534,8 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     nodeTimestamps,
     minDate,
     maxDate,
+    clusterToNodes: clusterData.clusterToNodes,
+    clusterColors: clusterData.clusterColors,
+    clusterMeta: clusterData.clusterMeta,
   });
 };

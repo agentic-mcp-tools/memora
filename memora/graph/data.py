@@ -19,6 +19,7 @@ STALE_DAYS = int(os.getenv("MEMORA_STALE_DAYS", "30"))
 
 from ..storage import (
     connect,
+    detect_clusters,
     get_crossrefs,
     get_memory,
     list_memories,
@@ -342,6 +343,98 @@ def _build_timeline_data(memories: List[Dict]) -> tuple:
     return node_timestamps, dates[0], dates[-1]
 
 
+CLUSTER_COLORS = [
+    "#ff6b6b", "#ffd93d", "#6bcb77", "#4d96ff",
+    "#ff922b", "#cc5de8", "#20c997", "#339af0",
+    "#f06595", "#a9e34b", "#22b8cf", "#845ef7",
+]
+
+
+def _build_cluster_data(
+    conn, memories: List[Dict], min_score: float = 0.5
+) -> Dict[str, Any]:
+    """Build cluster mappings using Louvain community detection.
+
+    Returns dict with clusterToNodes, nodeToCluster, clusterColors, clusterMeta.
+    """
+    # Filter out section memories
+    non_section_ids = [
+        m["id"] for m in memories if not is_section(m.get("metadata"))
+    ]
+
+    clusters = detect_clusters(
+        conn, min_cluster_size=3, min_score=min_score, algorithm="louvain"
+    )
+
+    if not clusters:
+        return {
+            "clusterToNodes": {},
+            "nodeToCluster": {},
+            "clusterColors": {},
+            "clusterMeta": {},
+        }
+
+    cluster_to_nodes: Dict[str, List[int]] = {}
+    node_to_cluster: Dict[str, int] = {}
+    cluster_colors: Dict[str, str] = {}
+    cluster_meta: Dict[str, Dict] = {}
+
+    non_section_set = set(non_section_ids)
+
+    for c in clusters:
+        cid = str(c["cluster_id"])
+        # Only include non-section memories that are in the graph
+        members = [mid for mid in c["memory_ids"] if mid in non_section_set]
+        if len(members) < 3:
+            continue
+
+        cluster_to_nodes[cid] = members
+        color = CLUSTER_COLORS[(c["cluster_id"] - 1) % len(CLUSTER_COLORS)]
+        cluster_colors[cid] = color
+
+        for mid in members:
+            node_to_cluster[str(mid)] = c["cluster_id"]
+
+        # Build a human-readable label from top tags
+        label_tags = [t for t in c.get("top_tags", []) if "/" not in t][:2]
+        if not label_tags:
+            label_tags = [t.split("/")[-1] for t in c.get("top_tags", [])[:2]]
+        label = ", ".join(label_tags) if label_tags else f"Cluster {cid}"
+
+        cluster_meta[cid] = {
+            "size": len(members),
+            "top_tags": c.get("top_tags", []),
+            "label": label,
+        }
+
+    return {
+        "clusterToNodes": cluster_to_nodes,
+        "nodeToCluster": node_to_cluster,
+        "clusterColors": cluster_colors,
+        "clusterMeta": cluster_meta,
+    }
+
+
+def _build_cluster_legend_html(
+    cluster_meta: Dict[str, Dict], cluster_colors: Dict[str, str]
+) -> str:
+    """Build HTML for cluster legend panel."""
+    html = ""
+    for cid, meta in cluster_meta.items():
+        color = cluster_colors.get(cid, "#8b949e")
+        label = meta["label"]
+        size = meta["size"]
+        html += (
+            f'<div class="cluster-item" data-cluster="{cid}" '
+            f"onclick=\"filterByCluster('{cid}')\">"
+            f'<span class="cluster-color" style="background:{color}"></span>'
+            f"{label} ({size})</div>"
+        )
+    if cluster_meta:
+        html += '<label class="hull-toggle"><input type="checkbox" onchange="toggleClusterHulls(this)"> Show boundaries</label>'
+    return html
+
+
 def _build_legend_html(tag_colors: Dict[str, str]) -> str:
     """Build HTML for tag legend."""
     return "".join(
@@ -426,7 +519,10 @@ def get_graph_data(min_score: float = 0.40, rebuild: bool = False) -> Dict[str, 
         # Build timeline data
         node_timestamps, min_date, max_date = _build_timeline_data(memories)
 
-        return {
+        # Build cluster data using Louvain community detection
+        cluster_data = _build_cluster_data(conn, memories)
+
+        result = {
             "nodes": nodes,
             "edges": edges,
             "tagColors": tag_colors,
@@ -442,6 +538,8 @@ def get_graph_data(min_score: float = 0.40, rebuild: bool = False) -> Dict[str, 
             "minDate": min_date,
             "maxDate": max_date,
         }
+        result.update(cluster_data)
+        return result
 
     finally:
         conn.close()
@@ -521,12 +619,14 @@ def export_graph_html(
                 "metadata": meta,
             }
 
+        # Build cluster data using Louvain community detection
+        cluster_data = _build_cluster_data(conn, memories)
+
         # Build HTML components
         legend_html = _build_legend_html(tag_colors)
         sections_html = _build_sections_html(section_to_nodes, path_to_nodes)
         issues_legend_html = build_issue_legend_html(status_to_nodes, issue_category_to_nodes)
         todos_legend_html = build_todo_legend_html(todo_status_to_nodes, todo_category_to_nodes)
-
         html = build_static_html(
             nodes_json=json.dumps(nodes),
             edges_json=json.dumps(edges),
@@ -547,6 +647,9 @@ def export_graph_html(
             min_date=min_date,
             max_date=max_date,
             version=_get_memora_version(),
+            cluster_to_nodes_json=json.dumps(cluster_data["clusterToNodes"]),
+            cluster_colors_json=json.dumps(cluster_data["clusterColors"]),
+            cluster_meta_json=json.dumps(cluster_data["clusterMeta"]),
         )
 
         result = {
