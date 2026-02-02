@@ -57,6 +57,9 @@ TYPE_PATTERNS: List[tuple[str, str]] = [
 # Duplicate detection threshold
 DUPLICATE_THRESHOLD = 0.85
 
+# Auto-assign hierarchy when top suggestion confidence >= this threshold
+AUTO_HIERARCHY_THRESHOLD = 0.5
+
 
 def _infer_type(content: str) -> Optional[str]:
     """Infer memory type from content prefix patterns."""
@@ -615,11 +618,37 @@ async def memory_create(
         if not new_path and related_memories:
             hierarchy_suggestions = _suggest_hierarchy_from_similar(related_memories)
             if hierarchy_suggestions:
-                suggestions["hierarchy"] = hierarchy_suggestions
-                suggestions["hierarchy_hint"] = (
-                    "Similar memories are organized under these paths. "
-                    "Use memory_update to add section/subsection metadata."
-                )
+                top = hierarchy_suggestions[0]
+                if top.get("confidence", 0) >= AUTO_HIERARCHY_THRESHOLD:
+                    # Auto-apply the top hierarchy suggestion
+                    auto_meta = {}
+                    if top.get("section"):
+                        auto_meta["section"] = top["section"]
+                    if top.get("subsection"):
+                        auto_meta["subsection"] = top["subsection"]
+                    if auto_meta:
+                        memory_id = record.get("id") if record else None
+                        if memory_id is not None:
+                            _update_memory(memory_id, None, auto_meta, None)
+                            result["auto_hierarchy"] = {
+                                "path": top["path"],
+                                "section": top.get("section"),
+                                "subsection": top.get("subsection"),
+                                "confidence": top["confidence"],
+                                "source_memory_ids": top.get("similar_memory_ids", []),
+                            }
+                            result["auto_hierarchy_hint"] = (
+                                f"Auto-assigned hierarchy '{'/'.join(top['path'])}' "
+                                f"(confidence: {top['confidence']}) based on similar memories. "
+                                "Use memory_update to change if needed."
+                            )
+                else:
+                    # Below threshold — suggest but don't apply
+                    suggestions["hierarchy"] = hierarchy_suggestions
+                    suggestions["hierarchy_hint"] = (
+                        "Similar memories are organized under these paths. "
+                        "Use memory_update to add section/subsection metadata."
+                    )
 
         if suggestions:
             result["suggestions"] = suggestions
