@@ -758,6 +758,8 @@ class CloudSQLiteBackend(StorageBackend):
             # Clear metadata to force download
             if self.meta_path.exists():
                 self.meta_path.unlink()
+            # Reset TTL cache to ensure sync_before_use() actually downloads
+            self._last_sync_check = 0.0
             self.sync_before_use()
 
     def force_sync_push(self) -> None:
