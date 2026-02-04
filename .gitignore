@@ -4,7 +4,8 @@ __pycache__/
 
 config/allowed_tags.json
 .DS_Store
-.claude/
+.claude/*
+!.claude/skills/
 
 # Local config
 .mcp.json
