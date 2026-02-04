@@ -1258,17 +1258,21 @@ def _delete_embedding(conn: sqlite3.Connection, memory_id: int) -> None:
 def _get_embeddings_for_ids(
     conn: sqlite3.Connection,
     memory_ids: List[int],
+    *,
+    batch_size: int = 50,
 ) -> Dict[int, Dict[str, float]]:
     if not memory_ids:
         return {}
-    placeholders = ",".join("?" for _ in memory_ids)
-    rows = conn.execute(
-        f"SELECT memory_id, embedding FROM memories_embeddings WHERE memory_id IN ({placeholders})",
-        memory_ids,
-    ).fetchall()
     mapping: Dict[int, Dict[str, float]] = {}
-    for row in rows:
-        mapping[row["memory_id"]] = _json_to_embedding(row["embedding"])
+    for i in range(0, len(memory_ids), batch_size):
+        batch = memory_ids[i : i + batch_size]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT memory_id, embedding FROM memories_embeddings WHERE memory_id IN ({placeholders})",
+            batch,
+        ).fetchall()
+        for row in rows:
+            mapping[row["memory_id"]] = _json_to_embedding(row["embedding"])
     return mapping
 
 
@@ -2074,10 +2078,12 @@ def delete_memories(conn: sqlite3.Connection, memory_ids: Iterable[int]) -> int:
         _delete_embedding(conn, memory_id)
         _clear_crossrefs(conn, memory_id)
         _remove_memory_from_crossrefs(conn, memory_id)
-    conn.execute(
-        f"DELETE FROM memories WHERE id IN ({','.join('?' for _ in ids)})",
-        ids,
-    )
+    for i in range(0, len(ids), 50):
+        batch = ids[i : i + 50]
+        conn.execute(
+            f"DELETE FROM memories WHERE id IN ({','.join('?' for _ in batch)})",
+            batch,
+        )
     conn.commit()
     return len(ids)
 
@@ -2887,10 +2893,12 @@ def clear_events(conn: sqlite3.Connection, event_ids: List[int]) -> int:
     if not event_ids:
         return 0
 
-    placeholders = ",".join(["?" for _ in event_ids])
-    conn.execute(
-        f"UPDATE memories_events SET consumed = 1 WHERE id IN ({placeholders})",
-        event_ids
-    )
+    for i in range(0, len(event_ids), 50):
+        batch = event_ids[i : i + 50]
+        placeholders = ",".join(["?" for _ in batch])
+        conn.execute(
+            f"UPDATE memories_events SET consumed = 1 WHERE id IN ({placeholders})",
+            batch
+        )
     conn.commit()
     return len(event_ids)
