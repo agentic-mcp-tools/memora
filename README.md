@@ -1,5 +1,7 @@
 <h1 align="center"><img src="media/memora_new.gif" width="60" alt="Memora Logo" align="absmiddle"> Memora</h1>
 
+<p align="center"><sub><sub><i>"You never truly know the value of a moment until it becomes a memory."</i></sub></sub></p>
+
 <p align="center">
 <b>Give your AI agents persistent memory</b><br>
 A lightweight MCP server for semantic memory storage, knowledge graphs, and cross-session context.
