@@ -240,6 +240,17 @@ def _emit_event(conn: sqlite3.Connection, memory_id: int, tags: List[str]) -> No
             pass
 
 
+def _log_action(conn: sqlite3.Connection, memory_id: int, action: str, summary: str) -> None:
+    """Log an action to the actions history table. Never fails core operations."""
+    try:
+        conn.execute(
+            "INSERT INTO memories_actions (memory_id, action, summary) VALUES (?, ?, ?)",
+            (memory_id, action, summary),
+        )
+    except Exception:
+        pass
+
+
 def connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
     """Create a database connection using the configured storage backend.
 
@@ -292,6 +303,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_embeddings_table(conn)
     _ensure_crossrefs_table(conn)
     _ensure_events_table(conn)
+    _ensure_actions_table(conn)
     _ensure_importance_columns(conn)
     _ensure_updated_at_column(conn)
 
@@ -358,6 +370,21 @@ def _ensure_events_table(conn: sqlite3.Connection) -> None:
             timestamp TEXT NOT NULL DEFAULT (datetime('now')),
             consumed INTEGER DEFAULT 0,
             FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.commit()
+
+
+def _ensure_actions_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memories_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER,
+            action TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            timestamp TEXT NOT NULL DEFAULT (datetime('now'))
         )
         """
     )
@@ -1442,6 +1469,7 @@ def add_link(
         _store_crossrefs(conn, to_id, existing_reverse)
         links_created.append({"from": to_id, "to": from_id, "edge_type": reverse_type})
 
+    _log_action(conn, from_id, "link", f"Linked #{from_id} -> #{to_id} ({edge_type})")
     return {"status": "linked", "links": links_created}
 
 
@@ -1480,6 +1508,8 @@ def remove_link(
             _store_crossrefs(conn, to_id, new_refs_reverse)
             removed.append({"from": to_id, "to": from_id})
 
+    if removed:
+        _log_action(conn, from_id, "unlink", f"Unlinked #{from_id} -> #{to_id}")
     return {"status": "unlinked", "removed": removed}
 
 
@@ -1849,6 +1879,7 @@ def add_memory(
     vector = _compute_embedding(content, prepared_metadata, validated_tags)
     _upsert_embedding(conn, memory_id, vector)
     _update_crossrefs(conn, memory_id)
+    _log_action(conn, memory_id, "create", f"Created memory #{memory_id}")
     conn.commit()
     _emit_event(conn, memory_id, validated_tags)
     return get_memory(conn, memory_id)
@@ -1901,6 +1932,9 @@ def add_memories(
         _fts_upsert(conn, memory_id, entry["content"], entry["metadata_json"], entry["tags_json"])
         _upsert_embedding(conn, memory_id, vector)
         _update_crossrefs(conn, memory_id)
+
+    for memory_id in inserted:
+        _log_action(conn, memory_id, "create", f"Created memory #{memory_id}")
 
     conn.commit()
 
@@ -1998,6 +2032,7 @@ def update_memory(
         # Skip cross-references update - too expensive for D1 HTTP API (~15 sec)
         # Cross-refs remain valid enough until manual rebuild via memory_rebuild_crossrefs
 
+    _log_action(conn, memory_id, "update", f"Updated memory #{memory_id}")
     conn.commit()
     _emit_event(conn, memory_id, new_tags)
 
@@ -2049,6 +2084,7 @@ def delete_memory(conn: sqlite3.Connection, memory_id: int) -> bool:
     _delete_embedding(conn, memory_id)
     _clear_crossrefs(conn, memory_id)
     _remove_memory_from_crossrefs(conn, memory_id)
+    _log_action(conn, memory_id, "delete", f"Deleted memory #{memory_id}")
     cur = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     conn.commit()
     return cur.rowcount > 0
@@ -2078,6 +2114,8 @@ def delete_memories(conn: sqlite3.Connection, memory_ids: Iterable[int]) -> int:
         _delete_embedding(conn, memory_id)
         _clear_crossrefs(conn, memory_id)
         _remove_memory_from_crossrefs(conn, memory_id)
+    for memory_id in ids:
+        _log_action(conn, memory_id, "delete", f"Deleted memory #{memory_id}")
     for i in range(0, len(ids), 50):
         batch = ids[i : i + 50]
         conn.execute(
@@ -2631,9 +2669,28 @@ def boost_memory(
         "UPDATE memories SET importance = ? WHERE id = ?",
         (new_importance, memory_id),
     )
+    _log_action(conn, memory_id, "boost", f"Boosted memory #{memory_id} by {boost_amount}")
     conn.commit()
 
     return get_memory(conn, memory_id)
+
+
+def get_action_history(conn: sqlite3.Connection, limit: int = 200) -> List[Dict[str, Any]]:
+    """Return recent action history entries."""
+    rows = conn.execute(
+        "SELECT id, memory_id, action, summary, timestamp FROM memories_actions ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "memory_id": row["memory_id"],
+            "action": row["action"],
+            "summary": row["summary"],
+            "timestamp": row["timestamp"],
+        }
+        for row in rows
+    ]
 
 
 def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:

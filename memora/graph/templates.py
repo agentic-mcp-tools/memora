@@ -61,8 +61,8 @@ div.vis-tooltip {
 #panel-tabs .tab { padding: 8px 20px; cursor: pointer; color: #8b949e; border-radius: 6px; font-size: 13px; font-weight: 500; transition: all 0.15s ease; }
 #panel-tabs .tab.active { color: #fff; background: linear-gradient(135deg, #238636 0%, #2ea043 100%); box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
 #panel-tabs .tab:not(.active):hover { color: #c9d1d9; background: #21262d; }
-#tab-detail, #tab-timeline { display: none; }
-#tab-detail.active, #tab-timeline.active { display: block; }
+#tab-detail, #tab-timeline, #tab-history { display: none; }
+#tab-detail.active, #tab-timeline.active, #tab-history.active { display: block; }
 #timeline-list { max-height: calc(100vh - 120px); overflow-y: auto; }
 #timeline-list .memory-item { padding: 10px; border-bottom: 1px solid #30363d; cursor: pointer; display: flex; flex-direction: column; }
 #timeline-list .memory-item:hover { background: #21262d; }
@@ -76,6 +76,23 @@ div.vis-tooltip {
 #timeline-list .details-btn { background: #21262d; border: 1px solid #30363d; color: #8b949e; padding: 2px 8px; border-radius: 4px; font-size: 10px; cursor: pointer; }
 #timeline-list .details-btn:hover { background: #30363d; color: #c9d1d9; }
 #timeline-list .memory-preview { color: #8b949e; font-size: 11px; line-height: 1.4; margin-top: 6px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+#history-list { max-height: calc(100vh - 120px); overflow-y: auto; }
+#history-list .action-item { padding: 8px 10px; border-bottom: 1px solid #30363d; display: flex; align-items: flex-start; gap: 8px; font-size: 12px; }
+#history-list .action-icon { flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
+#history-list .action-icon.create { background: #238636; color: #fff; }
+#history-list .action-icon.update { background: #1f6feb; color: #fff; }
+#history-list .action-icon.delete { background: #da3633; color: #fff; }
+#history-list .action-icon.boost { background: #d29922; color: #fff; }
+#history-list .action-icon.link { background: #8957e5; color: #fff; }
+#history-list .action-icon.unlink { background: #6e7681; color: #fff; }
+#history-list .action-icon.merge { background: #f78166; color: #fff; }
+#history-list .action-body { flex: 1; min-width: 0; }
+#history-list .action-summary { color: #c9d1d9; }
+#history-list .action-summary .mem-link { color: #58a6ff; cursor: pointer; }
+#history-list .action-summary .mem-link:hover { text-decoration: underline; }
+#history-list .action-summary .mem-link.deleted { color: #6e7681; cursor: default; text-decoration: line-through; pointer-events: none; }
+#history-list .action-count { color: #8b949e; font-size: 11px; margin-left: 4px; }
+#history-list .action-time { color: #8b949e; font-size: 10px; margin-top: 2px; }
 
 /* Timeline slider */
 #timeline-container {
@@ -717,8 +734,11 @@ function switchTab(tabName) {
     document.querySelector('#panel-tabs .tab[onclick*="' + tabName + '"]').classList.add('active');
     document.getElementById('tab-detail').classList.toggle('active', tabName === 'detail');
     document.getElementById('tab-timeline').classList.toggle('active', tabName === 'timeline');
+    document.getElementById('tab-history').classList.toggle('active', tabName === 'history');
     if (tabName === 'timeline') {
         populateTimelineList();
+    } else if (tabName === 'history') {
+        populateHistoryList();
     } else if (tabName === 'detail' && currentPanelMemoryId) {
         loadMemoryToPanel(currentPanelMemoryId);
     }
@@ -791,6 +811,70 @@ function renderTimelineList(memories) {
     // Scroll selected item into view
     var selected = document.querySelector('#timeline-list .memory-item.selected');
     if (selected) selected.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function populateHistoryList() {
+    fetch('/api/actions?limit=200')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.actions) renderHistoryList(data.actions);
+        })
+        .catch(function() {
+            document.getElementById('history-list').innerHTML = '<div style="padding:20px;color:#8b949e;">History is only available on the live server.</div>';
+        });
+}
+
+function renderHistoryList(actions) {
+    var iconMap = { create: '+', update: '~', delete: 'x', boost: '^', link: '&rarr;', unlink: '&times;', merge: '&oplus;' };
+    var existingIds = graphData ? new Set(graphData.nodes.map(function(n) { return n.id; })) : new Set();
+    // Group consecutive actions with same action type
+    var grouped = [];
+    actions.forEach(function(a) {
+        var last = grouped[grouped.length - 1];
+        if (last && last.action === a.action) {
+            last.items.push(a);
+            last.last_ts = a.timestamp;
+        } else {
+            grouped.push({ action: a.action, items: [a], timestamp: a.timestamp, last_ts: a.timestamp });
+        }
+    });
+    var html = grouped.map(function(g) {
+        var icon = iconMap[g.action] || '?';
+        var cls = g.action;
+        if (g.items.length === 1) {
+            var a = g.items[0];
+            var summary = escapeHtmlText(a.summary).replace(/#(\\d+)/g, function(match, id) {
+                if (existingIds.has(parseInt(id, 10))) {
+                    return '<span class="mem-link" onclick="showMemoryDetails(' + id + '); event.stopPropagation();">#' + id + '</span>';
+                }
+                return '<span class="mem-link deleted">#' + id + '</span>';
+            });
+            return '<div class="action-item">' +
+                '<div class="action-icon ' + cls + '">' + icon + '</div>' +
+                '<div class="action-body">' +
+                    '<div class="action-summary">' + summary + '</div>' +
+                    '<div class="action-time">' + a.timestamp + '</div>' +
+                '</div>' +
+            '</div>';
+        }
+        // Collapsed group
+        var ids = g.items.map(function(a) { return a.memory_id; });
+        var idLinks = ids.map(function(mid) {
+            if (existingIds.has(mid)) {
+                return '<span class="mem-link" onclick="showMemoryDetails(' + mid + '); event.stopPropagation();">#' + mid + '</span>';
+            }
+            return '<span class="mem-link deleted">#' + mid + '</span>';
+        }).join(', ');
+        var label = g.action.charAt(0).toUpperCase() + g.action.slice(1) + 'd';
+        return '<div class="action-item">' +
+            '<div class="action-icon ' + cls + '">' + icon + '</div>' +
+            '<div class="action-body">' +
+                '<div class="action-summary">' + label + ' ' + g.items.length + ' memories: ' + idLinks + '</div>' +
+                '<div class="action-time">' + g.timestamp + '</div>' +
+            '</div>' +
+        '</div>';
+    }).join('');
+    document.getElementById('history-list').innerHTML = html || '<div style="padding:20px;color:#8b949e;">No actions recorded yet.</div>';
 }
 
 function highlightMemoryInGraph(memId) {
@@ -915,6 +999,7 @@ function showPanel(mem) {
         document.querySelector('#panel-tabs .tab[onclick*="detail"]').classList.add('active');
         document.getElementById('tab-detail').classList.add('active');
         document.getElementById('tab-timeline').classList.remove('active');
+        document.getElementById('tab-history').classList.remove('active');
         currentTab = 'detail';
     }
 
@@ -1165,6 +1250,7 @@ Duplicates ({len(duplicate_ids)})</div></div>'''
         <div id="panel-tabs">
             <span class="tab active" onclick="switchTab('detail')">Details</span>
             <span class="tab" onclick="switchTab('timeline')">Timeline</span>
+            <span class="tab" onclick="switchTab('history')">History</span>
         </div>
         <div id="tab-detail" class="active">
             <h2 id="panel-title">Memory #</h2>
@@ -1174,6 +1260,9 @@ Duplicates ({len(duplicate_ids)})</div></div>'''
         </div>
         <div id="tab-timeline">
             <div id="timeline-list"></div>
+        </div>
+        <div id="tab-history">
+            <div id="history-list"><div style="padding:20px;color:#8b949e;">History is only available on the live server.</div></div>
         </div>
     </div>
     <div id="legend"><b>Tags</b>{legend_html}{issues_legend_html}{todos_legend_html}{duplicates_legend_html}<div class="reset" onclick="resetFilter()">Show All</div></div>
@@ -1289,6 +1378,7 @@ def get_spa_html(version: str = "") -> str:
         <div id="panel-tabs">
             <span class="tab active" onclick="switchTab('detail')">Details</span>
             <span class="tab" onclick="switchTab('timeline')">Timeline</span>
+            <span class="tab" onclick="switchTab('history')">History</span>
         </div>
         <div id="tab-detail" class="active">
             <h2 id="panel-title">Memory #</h2>
@@ -1298,6 +1388,9 @@ def get_spa_html(version: str = "") -> str:
         </div>
         <div id="tab-timeline">
             <div id="timeline-list"></div>
+        </div>
+        <div id="tab-history">
+            <div id="history-list"></div>
         </div>
     </div>
     <div id="legend"><b>Tags</b><span class="legend-toggle" onclick="toggleTags()">[+]</span><div id="legend-items"></div><div id="issues-legend-items"></div><div id="todos-legend-items"></div><div id="duplicates-legend-items"></div><div class="reset" onclick="resetFilter()">Show All</div></div>
@@ -1662,9 +1755,11 @@ def get_spa_html(version: str = "") -> str:
                     // Clear memory cache for fresh data
                     memoryCache = {{}};
 
-                    // Refresh timeline if on that tab
+                    // Refresh timeline or history if on that tab
                     if (currentTab === 'timeline') {{
                         populateTimelineList();
+                    }} else if (currentTab === 'history') {{
+                        populateHistoryList();
                     }}
                 }} catch (err) {{
                     console.error('Error refreshing graph:', err);

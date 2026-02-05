@@ -162,6 +162,18 @@ def start_graph_server(host: str, port: int) -> None:
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    async def api_actions(request: Request):
+        """API endpoint: Get action history."""
+        try:
+            from ..storage import get_action_history
+            limit = int(request.query_params.get("limit", "200"))
+            conn = connect()
+            actions = get_action_history(conn, limit=limit)
+            conn.close()
+            return JSONResponse({"actions": actions})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     async def graph_events(request: Request):
         """SSE endpoint for graph update notifications."""
         async def event_generator():
@@ -234,6 +246,7 @@ def start_graph_server(host: str, port: int) -> None:
             Route("/api/events", graph_events),
             Route("/api/memories", api_memories_list),
             Route("/api/memories/{id:int}", api_memory),
+            Route("/api/actions", api_actions),
             Route("/r2/{path:path}", r2_image_proxy),
         ]
     )

@@ -65,7 +65,7 @@ def escape_sql_string(s: str) -> str:
     return f"'{escaped}'"
 
 
-def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "memora-graph"):
+def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "memora-graph", replace: bool = False):
     """Export memora data to D1."""
     print("Connecting to source database...")
     backend = get_source_backend(source_uri)
@@ -88,18 +88,47 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
         crossrefs = cursor.fetchall()
         print(f"Found {len(crossrefs)} crossrefs")
 
+        # Get actions
+        print("Fetching actions...")
+        try:
+            cursor = conn.execute(
+                "SELECT id, memory_id, action, summary, timestamp FROM memories_actions"
+            )
+            actions = cursor.fetchall()
+        except Exception:
+            actions = []
+        print(f"Found {len(actions)} actions")
+
         # Generate SQL file
         print("Generating SQL...")
         sql_lines = [
             "-- Auto-generated sync from memora to D1",
             "-- WARNING: This will replace all data in D1",
             "",
-            "-- Clear existing data",
-            "DELETE FROM memories_crossrefs;",
-            "DELETE FROM memories;",
+            "-- Ensure actions table exists",
+            "CREATE TABLE IF NOT EXISTS memories_actions ("
+            "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "    memory_id INTEGER,"
+            "    action TEXT NOT NULL,"
+            "    summary TEXT NOT NULL,"
+            "    timestamp TEXT NOT NULL DEFAULT (datetime('now'))"
+            ");",
             "",
-            "-- Insert memories",
+            "",
         ]
+
+        if replace:
+            sql_lines.extend([
+                "-- Clear existing data (--replace mode)",
+                "DELETE FROM memories_actions;",
+                "DELETE FROM memories_crossrefs;",
+                "DELETE FROM memories;",
+                "",
+            ])
+
+        insert_verb = "INSERT" if replace else "INSERT OR REPLACE"
+
+        sql_lines.append(f"-- {insert_verb} memories")
 
         for row in memories:
             mem_id, content, metadata, tags, created_at, updated_at = row
@@ -122,14 +151,14 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
                 tags = "[]"
 
             sql_lines.append(
-                f"INSERT INTO memories (id, content, metadata, tags, created_at, updated_at) "
+                f"{insert_verb} INTO memories (id, content, metadata, tags, created_at, updated_at) "
                 f"VALUES ({mem_id}, {escape_sql_string(content)}, {escape_sql_string(metadata)}, "
                 f"{escape_sql_string(tags)}, {escape_sql_string(created_at)}, "
                 f"{escape_sql_string(updated_at) if updated_at else 'NULL'});"
             )
 
         sql_lines.append("")
-        sql_lines.append("-- Insert crossrefs")
+        sql_lines.append(f"-- {insert_verb} crossrefs")
 
         for row in crossrefs:
             memory_id, related = row
@@ -144,9 +173,21 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
                 related = "[]"
 
             sql_lines.append(
-                f"INSERT INTO memories_crossrefs (memory_id, related) "
+                f"{insert_verb} INTO memories_crossrefs (memory_id, related) "
                 f"VALUES ({memory_id}, {escape_sql_string(related)});"
             )
+
+        if actions:
+            sql_lines.append("")
+            sql_lines.append(f"-- {insert_verb} actions")
+            for row in actions:
+                action_id, memory_id, action, summary, timestamp = row
+                sql_lines.append(
+                    f"{insert_verb} INTO memories_actions (id, memory_id, action, summary, timestamp) "
+                    f"VALUES ({action_id}, {memory_id if memory_id is not None else 'NULL'}, "
+                    f"{escape_sql_string(action)}, {escape_sql_string(summary)}, "
+                    f"{escape_sql_string(timestamp)});"
+                )
 
         # Write SQL to temp file
         with tempfile.NamedTemporaryFile(
@@ -184,6 +225,7 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
         print("\nSync complete!")
         print(f"  Memories: {len(memories)}")
         print(f"  Crossrefs: {len(crossrefs)}")
+        print(f"  Actions: {len(actions)}")
 
         # Clean up temp file
         os.unlink(sql_file)
@@ -213,9 +255,14 @@ def main():
         default="memora-graph",
         help="Target D1 database name. Default: memora-graph.",
     )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Delete all D1 data before inserting. Default: upsert (INSERT OR REPLACE).",
+    )
     args = parser.parse_args()
 
-    export_to_d1(remote=args.remote, source_uri=args.source, database=args.database)
+    export_to_d1(remote=args.remote, source_uri=args.source, database=args.database, replace=args.replace)
 
 
 if __name__ == "__main__":

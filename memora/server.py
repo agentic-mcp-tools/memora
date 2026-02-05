@@ -1436,6 +1436,9 @@ async def memory_merge(
 
         # Delete source memory
         delete_memory(conn, source_id)
+
+        from .storage import _log_action
+        _log_action(conn, target_id, "merge", f"Merged #{source_id} into #{target_id}")
         conn.commit()
 
     _schedule_cloud_graph_sync()
