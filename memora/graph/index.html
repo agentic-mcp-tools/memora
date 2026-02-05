@@ -858,17 +858,44 @@ div.vis-tooltip {
             }
         }
 
+        var timelinePageSize = 50;
+        var timelineOffset = 0;
+        var timelineTotal = 0;
+        var timelineLoading = false;
+
         function populateTimelineList() {
+            timelineOffset = 0;
+            timelineTotal = 0;
+            cachedTimelineMemories = null;
             document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#8b949e;">Loading...</div>';
-            fetch('/api/memories' + getDbParam())
+            loadTimelinePage();
+        }
+
+        function loadTimelinePage() {
+            if (timelineLoading) return;
+            timelineLoading = true;
+            var dbp = getDbParam();
+            var sep = dbp ? dbp + '&' : '?';
+            fetch('/api/memories' + sep + 'limit=' + timelinePageSize + '&offset=' + timelineOffset)
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
+                    timelineLoading = false;
                     if (data.memories) {
-                        renderTimelineList(data.memories);
+                        timelineTotal = data.total || 0;
+                        if (!cachedTimelineMemories) {
+                            cachedTimelineMemories = data.memories;
+                        } else {
+                            cachedTimelineMemories = cachedTimelineMemories.concat(data.memories);
+                        }
+                        timelineOffset = cachedTimelineMemories.length;
+                        renderTimelineList(cachedTimelineMemories);
                     }
                 })
                 .catch(function(e) {
-                    document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#f85149;">Error loading memories</div>';
+                    timelineLoading = false;
+                    if (!cachedTimelineMemories) {
+                        document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#f85149;">Error loading memories</div>';
+                    }
                 });
         }
 
@@ -914,7 +941,11 @@ div.vis-tooltip {
                 '</div>';
             }).join('');
             var emptyMsg = timelineFilter === 'favorites' ? 'No favorites yet \u2014 click \u2606 to star a memory' : 'No memories';
-            document.getElementById('timeline-list').innerHTML = html || '<div style="padding:20px;color:#8b949e;">' + emptyMsg + '</div>';
+            var hasMore = timelineFilter === 'all' && timelineOffset < timelineTotal;
+            var loadMoreBtn = hasMore
+                ? '<div style="padding:12px 20px;text-align:center;"><button onclick="loadTimelinePage()" style="background:#238636;color:#fff;border:none;border-radius:6px;padding:6px 16px;cursor:pointer;font-size:13px;">Load more (' + (timelineTotal - timelineOffset) + ' remaining)</button></div>'
+                : '';
+            document.getElementById('timeline-list').innerHTML = (html + loadMoreBtn) || '<div style="padding:20px;color:#8b949e;">' + emptyMsg + '</div>';
 
             var selected = document.querySelector('#timeline-list .memory-item.selected');
             if (selected) selected.scrollIntoView({ block: 'center', behavior: 'smooth' });

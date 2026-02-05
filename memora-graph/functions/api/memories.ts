@@ -56,16 +56,17 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const dbName = url.searchParams.get("db");
   const db = getDatabase(env, dbName);
 
-  // Fetch all memories
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(url.searchParams.get("offset") || "0", 10) || 0, 0);
+
+  const countRow = await db.prepare("SELECT COUNT(*) as cnt FROM memories").first<{ cnt: number }>();
+  const total = countRow?.cnt ?? 0;
+
   const result = await db.prepare(
-    "SELECT id, content, metadata, tags, created_at, updated_at FROM memories ORDER BY created_at DESC"
-  ).all<Memory>();
+    "SELECT id, content, metadata, tags, created_at, updated_at FROM memories ORDER BY created_at DESC LIMIT ? OFFSET ?"
+  ).bind(limit, offset).all<Memory>();
 
-  if (!result.results || result.results.length === 0) {
-    return Response.json({ memories: [] });
-  }
-
-  const memories = result.results.map(m => {
+  const memories = (result.results || []).map(m => {
     const meta = parseJson<Record<string, unknown>>(m.metadata, {});
     return {
       id: m.id,
@@ -77,5 +78,5 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     };
   });
 
-  return Response.json({ memories });
+  return Response.json({ memories, total, limit, offset });
 };

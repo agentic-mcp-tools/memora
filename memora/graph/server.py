@@ -155,26 +155,36 @@ def start_graph_server(host: str, port: int) -> None:
             return JSONResponse({"error": str(e)}, status_code=500)
 
     async def api_memories_list(request: Request):
-        """API endpoint: Get all memories for timeline."""
+        """API endpoint: Get memories for timeline with pagination."""
         try:
+            limit = max(1, min(int(request.query_params.get("limit", "50")), 200))
+            offset = max(0, int(request.query_params.get("offset", "0")))
+
             conn = connect()
+            total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
             rows = conn.execute(
                 """SELECT id, content, created_at, updated_at, tags, metadata
-                   FROM memories ORDER BY created_at DESC"""
+                   FROM memories ORDER BY created_at DESC
+                   LIMIT ? OFFSET ?""",
+                (limit, offset),
             ).fetchall()
             conn.close()
             memories = []
             for row in rows:
-                import json
                 memories.append({
                     "id": row["id"],
                     "content": row["content"],
                     "created": row["created_at"].split(" ")[0] if row["created_at"] else "",
                     "updated": row["updated_at"].split(" ")[0] if row["updated_at"] else None,
                     "tags": json.loads(row["tags"]) if row["tags"] else [],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {}
+                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
                 })
-            return JSONResponse({"memories": memories})
+            return JSONResponse({
+                "memories": memories,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            })
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
