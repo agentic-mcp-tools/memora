@@ -356,6 +356,27 @@ memory_create_section(content="Architecture", section="docs", subsection="api")
 
 </details>
 
+<details id="memory-insights">
+<summary><big><big><strong>Memory Insights</strong></big></big></summary>
+
+Analyze stored memories and surface actionable insights:
+
+```python
+# Full analysis with LLM-powered pattern detection
+memory_insights(period="7d", include_llm_analysis=True)
+
+# Quick summary without LLM (faster, no API key needed)
+memory_insights(period="1m", include_llm_analysis=False)
+```
+
+Returns:
+- **Activity summary** — memories created in the period, grouped by type and tag
+- **Open items** — open TODOs and issues with stale detection (configurable via `MEMORA_STALE_DAYS`, default 14)
+- **Consolidation candidates** — similar memory pairs that could be merged
+- **LLM analysis** — themes, focus areas, knowledge gaps, and a summary (requires `OPENAI_API_KEY`)
+
+</details>
+
 <details id="memory-linking">
 <summary><big><big><strong>Memory Linking</strong></big></big></summary>
 
