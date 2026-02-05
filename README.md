@@ -42,6 +42,7 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, and cros
 - 📡 **Event Notifications** - Poll-based system for inter-agent communication
 - 📊 **Statistics & Analytics** - Tag usage, trends, and connection insights
 - 🧠 **Memory Insights** - Activity summary, stale detection, consolidation suggestions, and LLM-powered pattern analysis
+- 📜 **Action History** - Track all memory operations (create, update, delete, merge, boost, link) with grouped timeline view
 
 ## Install
 
@@ -249,8 +250,9 @@ To disable: add `"--no-graph"` to args in your MCP config.
 
 - **Details Panel** - View memory content, metadata, tags, and related memories
 - **Timeline Panel** - Browse memories chronologically, click to highlight in graph
+- **History Panel** - Action log of all operations with grouped consecutive entries and clickable memory references (deleted memories shown as strikethrough)
 - **Time Slider** - Filter memories by date range, drag to explore history
-- **Real-time Updates** - Graph and timeline update via SSE when memories change
+- **Real-time Updates** - Graph, timeline, and history update via SSE when memories change
 - **Filters** - Tag/section dropdowns, zoom controls
 - **Mermaid Rendering** - Code blocks render as diagrams
 
