@@ -22,6 +22,7 @@ from .storage import (
     delete_memories,
     export_memories,
     find_invalid_tag_entries,
+    generate_insights,
     get_backend_info,
     get_crossrefs,
     get_memory,
@@ -296,6 +297,11 @@ def _rebuild_embeddings(conn):
 @_with_connection
 def _get_statistics(conn):
     return get_statistics(conn)
+
+
+@_with_connection
+def _generate_insights(conn, period: str, stale_days: int, include_llm_analysis: bool):
+    return generate_insights(conn, period, stale_days, include_llm_analysis)
 
 
 @_with_connection
@@ -1142,6 +1148,31 @@ async def memory_stats() -> Dict[str, Any]:
     """Get statistics and analytics about stored memories."""
 
     return _get_statistics()
+
+
+@mcp.tool()
+async def memory_insights(
+    period: str = "7d",
+    include_llm_analysis: bool = True,
+) -> Dict[str, Any]:
+    """Analyze stored memories and produce actionable insights.
+
+    Returns activity summary, open items, consolidation suggestions,
+    and optional LLM-powered pattern detection.
+
+    Args:
+        period: Time period to analyze (e.g., "7d", "1m", "1y")
+        include_llm_analysis: If True, use LLM to detect patterns and themes
+
+    Returns:
+        Dictionary with:
+        - activity_summary: Created counts by type and tag
+        - open_items: Open TODOs and issues with stale detection
+        - consolidation_candidates: Similar memory pairs that could be merged
+        - llm_analysis: Themes, focus areas, gaps, and summary (or null)
+    """
+    stale_days = int(os.getenv("MEMORA_STALE_DAYS", "14"))
+    return _generate_insights(period, stale_days, include_llm_analysis)
 
 
 @mcp.tool()

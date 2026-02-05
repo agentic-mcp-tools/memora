@@ -2728,6 +2728,164 @@ def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
     return stats
 
 
+def generate_insights(
+    conn: sqlite3.Connection,
+    period: str = "7d",
+    stale_days: int = 14,
+    include_llm_analysis: bool = True,
+) -> Dict[str, Any]:
+    """Analyze stored memories and produce actionable insights.
+
+    Returns activity summary, open items, consolidation suggestions,
+    and optional LLM-powered pattern detection.
+    """
+    date_from = _parse_date_filter(period)
+
+    result: Dict[str, Any] = {
+        "period": period,
+        "date_from": date_from,
+    }
+
+    # --- A. Activity summary ---
+    period_memories = list_memories(conn, date_from=period)
+    by_type: Dict[str, int] = {}
+    by_tag: Dict[str, int] = {}
+    for mem in period_memories:
+        meta = mem.get("metadata") or {}
+        mem_type = meta.get("type", "knowledge")
+        by_type[mem_type] = by_type.get(mem_type, 0) + 1
+        for tag in mem.get("tags") or []:
+            by_tag[tag] = by_tag.get(tag, 0) + 1
+
+    result["activity_summary"] = {
+        "total_created": len(period_memories),
+        "by_type": dict(sorted(by_type.items(), key=lambda x: x[1], reverse=True)),
+        "by_tag": dict(sorted(by_tag.items(), key=lambda x: x[1], reverse=True)),
+    }
+
+    # --- B. Open items (TODOs and issues) ---
+    stale_cutoff = (datetime.utcnow() - timedelta(days=stale_days)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    open_todos = list_memories(
+        conn, metadata_filters={"type": "todo", "status": "open"}
+    )
+    open_issues = list_memories(
+        conn, metadata_filters={"type": "issue", "status": "open"}
+    )
+
+    def _compact_items(items: List[Dict[str, Any]]) -> tuple:
+        compact = []
+        stale_count = 0
+        for m in items:
+            is_stale = (m.get("created_at") or "") < stale_cutoff
+            if is_stale:
+                stale_count += 1
+            meta = m.get("metadata") or {}
+            compact.append({
+                "id": m["id"],
+                "preview": m["content"][:80] + "..." if len(m["content"]) > 80 else m["content"],
+                "created_at": m.get("created_at"),
+                "priority": meta.get("priority"),
+                "severity": meta.get("severity"),
+                "stale": is_stale,
+            })
+        return compact, stale_count
+
+    todo_items, todo_stale = _compact_items(open_todos)
+    issue_items, issue_stale = _compact_items(open_issues)
+
+    result["open_items"] = {
+        "todos": {"count": len(open_todos), "stale_count": todo_stale, "items": todo_items},
+        "issues": {"count": len(open_issues), "stale_count": issue_stale, "items": issue_items},
+        "stale_days_threshold": stale_days,
+    }
+
+    # --- C. Consolidation suggestions ---
+    period_ids = {m["id"] for m in period_memories}
+    all_candidates = find_duplicate_candidates(conn, min_similarity=0.6, max_similarity=0.95, limit=100)
+    scoped = [
+        c for c in all_candidates
+        if c["memory_a_id"] in period_ids or c["memory_b_id"] in period_ids
+    ][:10]
+
+    result["consolidation_candidates"] = {
+        "count": len(scoped),
+        "pairs": [
+            {
+                "memory_a_id": c["memory_a_id"],
+                "memory_b_id": c["memory_b_id"],
+                "similarity_score": round(c["similarity_score"], 3),
+            }
+            for c in scoped
+        ],
+    }
+
+    # --- D. LLM pattern detection ---
+    if not include_llm_analysis:
+        result["llm_analysis"] = None
+        return result
+
+    client = _get_llm_client()
+    if not client:
+        result["llm_analysis"] = None
+        return result
+
+    # Build compact memory list for the prompt (max 30, truncated to 200 chars)
+    memory_summaries = []
+    for mem in period_memories[:30]:
+        meta = mem.get("metadata") or {}
+        tags = mem.get("tags") or []
+        preview = mem["content"][:200]
+        memory_summaries.append(
+            f"[id={mem['id']} type={meta.get('type', 'knowledge')} tags={','.join(tags)}] {preview}"
+        )
+
+    prompt = f"""Analyze these {len(memory_summaries)} memory entries from the last {period} and provide insights.
+
+Memories:
+{chr(10).join(memory_summaries)}
+
+Respond with JSON only (no markdown):
+{{
+  "themes": ["list of 2-5 recurring themes or topics"],
+  "focus_areas": ["list of 2-4 areas where most work is concentrated"],
+  "consolidation_suggestions": "Brief advice on which memories could be merged or reorganized",
+  "knowledge_gaps": "Areas that seem under-documented or missing context",
+  "summary": "2-3 sentence overall summary of recent memory activity"
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a knowledge management analyst. Analyze memory entries and provide actionable insights. Always respond with valid JSON only.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=500,
+        )
+
+        result_text = response.choices[0].message.content.strip()
+        llm_result = json.loads(result_text)
+
+        # Ensure expected fields
+        for key in ("themes", "focus_areas", "consolidation_suggestions", "knowledge_gaps", "summary"):
+            if key not in llm_result:
+                llm_result[key] = None
+
+        result["llm_analysis"] = llm_result
+
+    except (json.JSONDecodeError, Exception):
+        result["llm_analysis"] = None
+
+    return result
+
+
 def export_memories(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     """Export all memories to a JSON-serializable list."""
     rows = conn.execute(
