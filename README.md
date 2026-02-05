@@ -41,6 +41,7 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, and cros
 - 🌐 **Live Graph Server** - Built-in HTTP server with cloud-hosted option (D1/Pages)
 - 📡 **Event Notifications** - Poll-based system for inter-agent communication
 - 📊 **Statistics & Analytics** - Tag usage, trends, and connection insights
+- 🧠 **Memory Insights** - Activity summary, stale detection, consolidation suggestions, and LLM-powered pattern analysis
 
 ## Install
 
