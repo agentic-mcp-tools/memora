@@ -76,6 +76,13 @@ div.vis-tooltip {
 #timeline-list .details-btn { background: #21262d; border: 1px solid #30363d; color: #8b949e; padding: 2px 8px; border-radius: 4px; font-size: 10px; cursor: pointer; }
 #timeline-list .details-btn:hover { background: #30363d; color: #c9d1d9; }
 #timeline-list .memory-preview { color: #8b949e; font-size: 11px; line-height: 1.4; margin-top: 6px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+#timeline-list .favorite-star { cursor: pointer; font-size: 14px; color: #6e7681; margin-right: 4px; }
+#timeline-list .favorite-star.active { color: #e3b341; }
+#timeline-list .favorite-star:hover { color: #e3b341; }
+#timeline-filter { display: flex; gap: 4px; padding: 8px 10px; border-bottom: 1px solid #30363d; }
+#timeline-filter .filter-btn { background: none; border: 1px solid #30363d; color: #8b949e; padding: 3px 10px; border-radius: 12px; font-size: 11px; cursor: pointer; }
+#timeline-filter .filter-btn:hover { background: #21262d; color: #c9d1d9; }
+#timeline-filter .filter-btn.active { background: #30363d; color: #e3b341; border-color: #e3b341; }
 #history-list { max-height: calc(100vh - 120px); overflow-y: auto; }
 #history-list .action-item { padding: 8px 10px; border-bottom: 1px solid #30363d; display: flex; align-items: flex-start; gap: 8px; font-size: 12px; }
 #history-list .action-icon { flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
@@ -782,11 +789,26 @@ function populateTimelineList() {
     }
 }
 
+var timelineFilter = 'all';
+var cachedTimelineMemories = null;
+
+function filterTimeline(mode) {
+    timelineFilter = mode;
+    document.querySelectorAll('#timeline-filter .filter-btn').forEach(function(btn) {
+        btn.classList.toggle('active', btn.textContent.indexOf(mode === 'favorites' ? 'Favorites' : 'Show All') !== -1);
+    });
+    if (cachedTimelineMemories) renderTimelineList(cachedTimelineMemories);
+}
+
 function renderTimelineList(memories) {
     // Filter out section placeholders
     memories = memories.filter(function(mem) {
         return !(mem.metadata && mem.metadata.type === 'section');
     });
+    cachedTimelineMemories = memories;
+    if (timelineFilter === 'favorites') {
+        memories = memories.filter(function(mem) { return mem.metadata && mem.metadata.favorite; });
+    }
     memories.sort(function(a, b) {
         return new Date(b.created) - new Date(a.created);
     });
@@ -795,9 +817,12 @@ function renderTimelineList(memories) {
         var headline = getMemoryHeadline(mem.content);
         var preview = getMemoryPreview(mem.content);
         var selectedClass = (currentPanelMemoryId === mem.id) ? ' selected' : '';
+        var isFav = mem.metadata && mem.metadata.favorite;
+        var starClass = 'favorite-star' + (isFav ? ' active' : '');
+        var starIcon = isFav ? '\\u2605' : '\\u2606';
         return '<div class="memory-item' + selectedClass + '" data-id="' + mem.id + '" onclick="highlightMemoryInGraph(' + mem.id + ')">' +
             '<div class="memory-header">' +
-                '<div class="memory-title"><span class="id">#' + mem.id + '</span><span class="headline">' + escapeHtmlText(headline) + '</span></div>' +
+                '<div class="memory-title"><span class="' + starClass + '" onclick="toggleFavorite(' + mem.id + ', this); event.stopPropagation();">' + starIcon + '</span><span class="id">#' + mem.id + '</span><span class="headline">' + escapeHtmlText(headline) + '</span></div>' +
                 '<div class="memory-actions">' +
                     '<span class="memory-date">' + mem.created + '</span>' +
                     '<button class="details-btn" onclick="showMemoryDetails(' + mem.id + '); event.stopPropagation();">Details</button>' +
@@ -806,11 +831,32 @@ function renderTimelineList(memories) {
             '<div class="memory-preview">' + escapeHtmlText(preview) + '</div>' +
         '</div>';
     }).join('');
-    document.getElementById('timeline-list').innerHTML = html || '<div style="padding:20px;color:#8b949e;">No memories</div>';
+    var emptyMsg = timelineFilter === 'favorites' ? 'No favorites yet — click \\u2606 to star a memory' : 'No memories';
+    document.getElementById('timeline-list').innerHTML = html || '<div style="padding:20px;color:#8b949e;">' + emptyMsg + '</div>';
 
     // Scroll selected item into view
     var selected = document.querySelector('#timeline-list .memory-item.selected');
     if (selected) selected.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function toggleFavorite(memId, el) {
+    var isActive = el.classList.contains('active');
+    var newState = !isActive;
+    el.classList.toggle('active', newState);
+    el.textContent = newState ? '\\u2605' : '\\u2606';
+    if (cachedTimelineMemories) {
+        cachedTimelineMemories.forEach(function(mem) {
+            if (mem.id === memId) {
+                if (!mem.metadata) mem.metadata = {};
+                if (newState) { mem.metadata.favorite = true; } else { delete mem.metadata.favorite; }
+            }
+        });
+    }
+    fetch('/api/memories/' + memId + '/favorite', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ favorite: newState })
+    });
 }
 
 function populateHistoryList() {
@@ -1259,6 +1305,7 @@ Duplicates ({len(duplicate_ids)})</div></div>'''
             <div class="content" id="panel-content"></div>
         </div>
         <div id="tab-timeline">
+            <div id="timeline-filter"><button class="filter-btn" onclick="filterTimeline('favorites')">&#9733; Favorites</button><button class="filter-btn active" onclick="filterTimeline('all')">Show All</button></div>
             <div id="timeline-list"></div>
         </div>
         <div id="tab-history">
@@ -1387,6 +1434,7 @@ def get_spa_html(version: str = "") -> str:
             <div class="content" id="panel-content"></div>
         </div>
         <div id="tab-timeline">
+            <div id="timeline-filter"><button class="filter-btn" onclick="filterTimeline('favorites')">&#9733; Favorites</button><button class="filter-btn active" onclick="filterTimeline('all')">Show All</button></div>
             <div id="timeline-list"></div>
         </div>
         <div id="tab-history">

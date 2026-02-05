@@ -51,6 +51,42 @@ function expandR2Urls(metadata: Record<string, unknown> | null): Record<string, 
   return metadata;
 }
 
+export const onRequestPatch: PagesFunction<Env> = async ({ env, params, request }) => {
+  const url = new URL(request.url);
+  const dbName = url.searchParams.get("db");
+  const db = getDatabase(env, dbName);
+
+  const id = parseInt(params.id as string, 10);
+  if (isNaN(id)) {
+    return Response.json({ error: "invalid_id" }, { status: 400 });
+  }
+
+  const body = await request.json<{ favorite?: boolean }>();
+  const favorite = Boolean(body.favorite);
+
+  // Read current metadata
+  const row = await db.prepare(
+    "SELECT metadata FROM memories WHERE id = ?"
+  ).bind(id).first<{ metadata: string }>();
+
+  if (!row) {
+    return Response.json({ error: "not_found" }, { status: 404 });
+  }
+
+  const meta = parseJson<Record<string, unknown>>(row.metadata, {});
+  if (favorite) {
+    meta.favorite = true;
+  } else {
+    delete meta.favorite;
+  }
+
+  await db.prepare(
+    "UPDATE memories SET metadata = ?, updated_at = datetime('now') WHERE id = ?"
+  ).bind(JSON.stringify(meta), id).run();
+
+  return Response.json({ ok: true });
+};
+
 export const onRequestGet: PagesFunction<Env> = async ({ env, params, request }) => {
   const url = new URL(request.url);
   const dbName = url.searchParams.get("db");

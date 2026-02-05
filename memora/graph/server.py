@@ -14,7 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .data import export_graph_html, get_graph_data, get_memory_for_api
 from .templates import get_spa_html
-from ..storage import connect
+from ..storage import connect, update_memory
 
 def _get_memora_version() -> str:
     try:
@@ -207,6 +207,34 @@ def start_graph_server(host: str, port: int) -> None:
 
         return EventSourceResponse(event_generator())
 
+    async def api_memory_patch(request: Request):
+        """API endpoint: Toggle favorite on a memory."""
+        import json
+        try:
+            memory_id = int(request.path_params.get("id"))
+            body = await request.json()
+            favorite = bool(body.get("favorite", False))
+
+            conn = connect()
+            row = conn.execute(
+                "SELECT metadata FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
+            if not row:
+                conn.close()
+                return JSONResponse({"error": "not_found"}, status_code=404)
+
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            if favorite:
+                metadata["favorite"] = True
+            else:
+                metadata.pop("favorite", None)
+
+            update_memory(conn, memory_id, metadata=metadata)
+            conn.close()
+            return JSONResponse({"ok": True})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     async def r2_image_proxy(request: Request):
         """Proxy images from R2 storage."""
         try:
@@ -246,6 +274,7 @@ def start_graph_server(host: str, port: int) -> None:
             Route("/api/events", graph_events),
             Route("/api/memories", api_memories_list),
             Route("/api/memories/{id:int}", api_memory),
+            Route("/api/memories/{id:int}/favorite", api_memory_patch, methods=["PATCH"]),
             Route("/api/actions", api_actions),
             Route("/r2/{path:path}", r2_image_proxy),
         ]
