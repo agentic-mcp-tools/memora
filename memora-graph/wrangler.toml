@@ -34,3 +34,5 @@ WS_WORKER_URL = "https://memora-graph-sync.cloudflare-strategic612.workers.dev"
 DEFAULT_DB = "memora"
 # Database config (JSON) - maps db name to binding suffix
 DB_CONFIG = '{"memora": "MEMORA", "ob1": "OB1"}'
+# Chat LLM model (via OpenRouter). Set OPENROUTER_API_KEY as a secret.
+CHAT_MODEL = "openai/gpt-4o-mini"

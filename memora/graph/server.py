@@ -1,6 +1,7 @@
 """HTTP server and routes for graph visualization."""
 
 import asyncio
+import functools
 import logging
 import socket
 import sys
@@ -15,7 +16,7 @@ import json
 from importlib.resources import files as _pkg_files
 
 from .data import get_graph_data, get_memory_for_api
-from ..storage import connect, update_memory
+from ..storage import connect, update_memory, hybrid_search, _get_llm_client, LLM_MODEL
 
 
 logger = logging.getLogger(__name__)
@@ -281,11 +282,113 @@ def start_graph_server(host: str, port: int) -> None:
             logger.exception("R2 image proxy request failed: %s", e)
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    async def api_chat(request: Request):
+        """API endpoint: Chat about memories using LLM with RAG."""
+        try:
+            body = await request.json()
+            message = body.get("message", "").strip()
+            history = body.get("history", [])
+
+            if not message:
+                return JSONResponse({"error": "empty_message"}, status_code=400)
+
+            client = _get_llm_client()
+            if not client:
+                return JSONResponse(
+                    {"error": "llm_not_configured",
+                     "message": "LLM not configured. Set OPENAI_API_KEY and OPENAI_BASE_URL environment variables."},
+                    status_code=503,
+                )
+
+            # Search relevant memories via hybrid search (sync, run in executor)
+            loop = asyncio.get_event_loop()
+            conn = connect()
+            try:
+                results = await loop.run_in_executor(
+                    None, functools.partial(hybrid_search, conn, message, top_k=8)
+                )
+            finally:
+                conn.close()
+
+            # Build context from search results
+            references = []
+            context_parts = []
+            for r in results:
+                mem = r.get("memory", r)
+                score = r.get("score", 0.0)
+                references.append({
+                    "id": mem["id"],
+                    "score": round(score, 3),
+                    "preview": mem["content"][:100].replace("\n", " "),
+                })
+                tags_str = ", ".join(mem.get("tags", []))
+                content_truncated = mem["content"][:500]
+                context_parts.append(
+                    f"Memory #{mem['id']} (tags: {tags_str}):\n{content_truncated}"
+                )
+
+            context_block = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant memories found."
+
+            system_msg = {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant answering questions about the user's personal knowledge base.\n"
+                    "Use the following memories as context. When referencing a memory, cite it as [Memory #<id>].\n"
+                    "If the memories don't contain relevant information, say so honestly.\n\n"
+                    f"## Relevant Memories\n\n{context_block}"
+                ),
+            }
+
+            # Build messages: system + last 20 history messages + current
+            trimmed_history = history[-20:]
+            messages = [system_msg] + trimmed_history + [{"role": "user", "content": message}]
+
+            async def event_generator():
+                # Emit references first
+                yield {"event": "references", "data": json.dumps(references)}
+
+                # Stream LLM response via thread bridge
+                queue: asyncio.Queue = asyncio.Queue()
+
+                def run_llm():
+                    try:
+                        stream = client.chat.completions.create(
+                            model=LLM_MODEL,
+                            messages=messages,
+                            stream=True,
+                            temperature=0.7,
+                            max_tokens=2000,
+                        )
+                        for chunk in stream:
+                            delta = chunk.choices[0].delta
+                            if delta.content:
+                                loop.call_soon_threadsafe(queue.put_nowait, ("token", delta.content))
+                        loop.call_soon_threadsafe(queue.put_nowait, ("done", ""))
+                    except Exception as e:
+                        loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)[:200]))
+
+                llm_thread = threading.Thread(target=run_llm, daemon=True)
+                llm_thread.start()
+
+                while True:
+                    event_type, data = await queue.get()
+                    # JSON-encode token data to preserve newlines in SSE transport
+                    encoded = json.dumps(data) if event_type == "token" else data
+                    yield {"event": event_type, "data": encoded}
+                    if event_type in ("done", "error"):
+                        break
+
+            return EventSourceResponse(event_generator())
+
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     app = Starlette(
         routes=[
             Route("/graph", graph_handler),
             Route("/api/graph", api_graph),
             Route("/api/events", graph_events),
+            Route("/api/chat", api_chat, methods=["POST"]),
             Route("/api/memories", api_memories_list),
             Route("/api/memories/{id:int}", api_memory),
             Route("/api/memories/{id:int}/favorite", api_memory_patch, methods=["PATCH"]),
