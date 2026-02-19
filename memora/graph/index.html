@@ -364,8 +364,16 @@ div.vis-tooltip {
 #chat-toggle { position: fixed; bottom: 20px; left: 20px; width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, #238636 0%, #2ea043 100%); border: none; color: #fff; font-size: 22px; cursor: pointer; z-index: 200; box-shadow: 0 4px 12px rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; transition: transform 0.2s ease, box-shadow 0.2s ease; }
 #chat-toggle:hover { transform: scale(1.1); box-shadow: 0 6px 16px rgba(0,0,0,0.5); }
 #chat-toggle.hidden { display: none; }
-#chat-panel { position: fixed; bottom: 0; left: 20px; width: 520px; height: 480px; background: #161b22; border: 1px solid #238636; border-bottom: none; border-radius: 12px 12px 0 0; z-index: 200; display: flex; flex-direction: column; transform: translateY(100%); transition: transform 0.3s ease; box-shadow: 0 -4px 20px rgba(35,134,54,0.3); }
+#chat-panel { position: fixed; bottom: 0; left: 20px; width: 520px; height: 480px; background: #161b22; border: 1px solid #238636; border-bottom: none; border-radius: 12px 12px 0 0; z-index: 200; display: flex; flex-direction: column; transform: translateY(100%); transition: transform 0.3s ease, height 0s; box-shadow: 0 -4px 20px rgba(35,134,54,0.3); min-height: 200px; max-height: 90vh; min-width: 320px; max-width: 90vw; }
 #chat-panel.open { transform: translateY(0); }
+#chat-panel.dragging { transition: none; }
+#chat-resize-handle { height: 6px; cursor: ns-resize; background: transparent; border-radius: 12px 12px 0 0; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+#chat-resize-handle::after { content: ''; width: 40px; height: 3px; background: #30363d; border-radius: 2px; }
+#chat-resize-handle:hover::after { background: #58a6ff; }
+#chat-resize-right { position: absolute; top: 0; right: -3px; width: 6px; height: 100%; cursor: ew-resize; z-index: 201; }
+#chat-resize-right:hover { background: rgba(88,166,255,0.3); }
+#chat-resize-corner { position: absolute; top: -3px; right: -3px; width: 12px; height: 12px; cursor: nesw-resize; z-index: 202; }
+#chat-resize-corner:hover { background: rgba(88,166,255,0.3); border-radius: 0 6px 0 0; }
 #chat-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid #30363d; flex-shrink: 0; cursor: pointer; }
 #chat-header:hover { background: #1c2128; }
 #chat-header .title { font-size: 14px; font-weight: 600; color: #c9d1d9; }
@@ -477,6 +485,9 @@ div.vis-tooltip {
     <div id="node-tooltip"></div>
     <button id="chat-toggle" onclick="toggleChat()" title="Chat about memories">&#x1F4AC;</button>
     <div id="chat-panel">
+        <div id="chat-resize-handle"></div>
+        <div id="chat-resize-right"></div>
+        <div id="chat-resize-corner"></div>
         <div id="chat-header" onclick="toggleChat()">
             <span class="title">Chat</span>
             <button class="collapse-btn" title="Collapse">&#x25BC;</button>
@@ -2023,6 +2034,72 @@ div.vis-tooltip {
             btn.classList.toggle('open');
             btn.innerHTML = wrapper.classList.contains('open') ? '&#x2715;' : '&#9776;';
         }
+
+        // Chat panel resize by dragging (height, width, corner)
+        (function() {
+            var panel = document.getElementById('chat-panel');
+            var topHandle = document.getElementById('chat-resize-handle');
+            var rightHandle = document.getElementById('chat-resize-right');
+            var cornerHandle = document.getElementById('chat-resize-corner');
+            var startX, startY, startW, startH;
+
+            function beginDrag(e) {
+                e.preventDefault();
+                startX = e.clientX; startY = e.clientY;
+                startW = panel.offsetWidth; startH = panel.offsetHeight;
+                panel.classList.add('dragging');
+            }
+
+            // Top handle — resize height
+            topHandle.addEventListener('mousedown', function(e) {
+                beginDrag(e);
+                document.addEventListener('mousemove', dragHeight);
+                document.addEventListener('mouseup', releaseHeight);
+            });
+            function dragHeight(e) {
+                var maxH = window.innerHeight * 0.9;
+                panel.style.height = Math.max(200, Math.min(startH + (startY - e.clientY), maxH)) + 'px';
+            }
+            function releaseHeight() {
+                panel.classList.remove('dragging');
+                document.removeEventListener('mousemove', dragHeight);
+                document.removeEventListener('mouseup', releaseHeight);
+            }
+
+            // Right handle — resize width
+            rightHandle.addEventListener('mousedown', function(e) {
+                beginDrag(e);
+                document.addEventListener('mousemove', dragWidth);
+                document.addEventListener('mouseup', releaseWidth);
+            });
+            function dragWidth(e) {
+                var maxW = window.innerWidth * 0.9;
+                panel.style.width = Math.max(320, Math.min(startW + (e.clientX - startX), maxW)) + 'px';
+            }
+            function releaseWidth() {
+                panel.classList.remove('dragging');
+                document.removeEventListener('mousemove', dragWidth);
+                document.removeEventListener('mouseup', releaseWidth);
+            }
+
+            // Corner handle — resize both
+            cornerHandle.addEventListener('mousedown', function(e) {
+                beginDrag(e);
+                document.addEventListener('mousemove', dragBoth);
+                document.addEventListener('mouseup', releaseBoth);
+            });
+            function dragBoth(e) {
+                var maxH = window.innerHeight * 0.9;
+                var maxW = window.innerWidth * 0.9;
+                panel.style.height = Math.max(200, Math.min(startH + (startY - e.clientY), maxH)) + 'px';
+                panel.style.width = Math.max(320, Math.min(startW + (e.clientX - startX), maxW)) + 'px';
+            }
+            function releaseBoth() {
+                panel.classList.remove('dragging');
+                document.removeEventListener('mousemove', dragBoth);
+                document.removeEventListener('mouseup', releaseBoth);
+            }
+        })();
 
         function toggleChat() {
             chatOpen = !chatOpen;
