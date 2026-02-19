@@ -10,11 +10,7 @@ Usage:
     python link-r2-images.py --bucket ob1 --d1-id <database-id> [--dry-run]
 
 Examples:
-    # ob1
-    AWS_PROFILE=ob1 python link-r2-images.py --bucket ob1 --d1-id d194a6e6-44fa-437d-bfd7-1196c6dc9955
-
-    # memora
-    AWS_PROFILE=memora python link-r2-images.py --bucket memora --d1-id bc1f5b0b-474d-4b96-a2f3-d15279b2ca57
+    AWS_PROFILE=myprofile python link-r2-images.py --bucket my-bucket --d1-id <database-id>
 """
 
 import argparse
