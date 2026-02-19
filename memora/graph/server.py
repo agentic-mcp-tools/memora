@@ -17,7 +17,86 @@ import json
 from importlib.resources import files as _pkg_files
 
 from .data import get_graph_data, get_memory_for_api
-from ..storage import connect, update_memory, hybrid_search, _get_llm_client, LLM_MODEL
+from ..storage import connect, add_memory, update_memory, delete_memory, get_memory, hybrid_search, _get_llm_client, LLM_MODEL
+
+
+CHAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_memory",
+            "description": "Create a new memory in the knowledge base. Use when the user asks to save, create, add, or remember something.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The full text content of the memory."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags to categorize the memory."},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_memory",
+            "description": "Update an existing memory by ID. Use when the user asks to modify, edit, or change a specific memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "integer", "description": "The ID of the memory to update."},
+                    "content": {"type": "string", "description": "New full text content. Replaces existing content."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags. Replaces all existing tags."},
+                },
+                "required": ["memory_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_memory",
+            "description": "Delete a memory by ID. Use when the user asks to remove or delete a specific memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "integer", "description": "The ID of the memory to delete."},
+                },
+                "required": ["memory_id"],
+            },
+        },
+    },
+]
+
+
+def _execute_chat_tool(tool_name: str, arguments: dict) -> str:
+    """Execute a chat tool call and return result as JSON string."""
+    conn = connect()
+    try:
+        if tool_name == "create_memory":
+            result = add_memory(conn, content=arguments["content"], tags=arguments.get("tags"))
+            return json.dumps({"success": True, "action": "created", "memory_id": result["id"], "preview": result["content"][:100]})
+
+        elif tool_name == "update_memory":
+            mid = arguments["memory_id"]
+            result = update_memory(conn, mid, content=arguments.get("content"), tags=arguments.get("tags"))
+            if result is None:
+                return json.dumps({"success": False, "error": f"Memory #{mid} not found."})
+            return json.dumps({"success": True, "action": "updated", "memory_id": mid, "preview": result["content"][:100]})
+
+        elif tool_name == "delete_memory":
+            mid = arguments["memory_id"]
+            existing = get_memory(conn, mid)
+            if not existing:
+                return json.dumps({"success": False, "error": f"Memory #{mid} not found."})
+            delete_memory(conn, mid)
+            return json.dumps({"success": True, "action": "deleted", "memory_id": mid, "preview": existing["content"][:100]})
+
+        return json.dumps({"success": False, "error": f"Unknown tool: {tool_name}"})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)[:200]})
+    finally:
+        conn.close()
 
 
 logger = logging.getLogger(__name__)
@@ -333,9 +412,20 @@ def start_graph_server(host: str, port: int) -> None:
             system_msg = {
                 "role": "system",
                 "content": (
-                    "You are a helpful assistant answering questions about the user's personal knowledge base.\n"
+                    "You are a helpful assistant for the user's personal knowledge base (Memora).\n"
                     "Use the following memories as context. When referencing a memory, cite it as [Memory #<id>].\n"
                     "If the memories don't contain relevant information, say so honestly.\n\n"
+                    "## Tool Use — IMPORTANT\n\n"
+                    "You have tools to create, update, and delete memories. You MUST call the appropriate tool when the user asks to:\n"
+                    "- Create/save/add/remember something → call create_memory\n"
+                    "- Update/edit/modify a memory → call update_memory\n"
+                    "- Delete/remove a memory → call delete_memory\n\n"
+                    "ALWAYS call the tool directly. Do NOT ask for confirmation, do NOT say you can't find the memory, "
+                    "do NOT suggest content without calling the tool.\n"
+                    "The memory database has many more entries than what's shown in context below — "
+                    "if the user references a memory ID, trust them and call the tool.\n"
+                    "When creating a memory, write substantive, well-structured content.\n"
+                    "When updating, apply the user's requested changes to the existing content.\n\n"
                     f"## Relevant Memories\n\n{context_block}"
                 ),
             }
@@ -354,17 +444,94 @@ def start_graph_server(host: str, port: int) -> None:
                 def run_llm():
                     try:
                         chat_model = os.getenv("CHAT_MODEL", "") or LLM_MODEL
+
+                        # First LLM call — may produce tool_calls
                         stream = client.chat.completions.create(
                             model=chat_model,
                             messages=messages,
+                            tools=CHAT_TOOLS,
                             stream=True,
                             temperature=0.7,
                             max_tokens=2000,
                         )
+
+                        content_text = ""
+                        tool_calls_by_index = {}
+
                         for chunk in stream:
+                            delta = chunk.choices[0].delta
+
+                            # Content tokens — stream immediately
+                            if delta.content:
+                                content_text += delta.content
+                                loop.call_soon_threadsafe(queue.put_nowait, ("token", delta.content))
+
+                            # Tool call deltas — accumulate
+                            if delta.tool_calls:
+                                for tc in delta.tool_calls:
+                                    idx = tc.index
+                                    if idx not in tool_calls_by_index:
+                                        tool_calls_by_index[idx] = {"id": "", "name": "", "arguments": ""}
+                                    entry = tool_calls_by_index[idx]
+                                    if tc.id:
+                                        entry["id"] = tc.id
+                                    if tc.function and tc.function.name:
+                                        entry["name"] = tc.function.name
+                                    if tc.function and tc.function.arguments:
+                                        entry["arguments"] += tc.function.arguments
+
+                        # No tool calls — done
+                        if not tool_calls_by_index:
+                            loop.call_soon_threadsafe(queue.put_nowait, ("done", ""))
+                            return
+
+                        # Execute tool calls
+                        tool_results = []
+                        for idx in sorted(tool_calls_by_index.keys()):
+                            tc = tool_calls_by_index[idx]
+                            try:
+                                args = json.loads(tc["arguments"])
+                            except json.JSONDecodeError:
+                                args = {}
+
+                            result_str = _execute_chat_tool(tc["name"], args)
+
+                            # Emit action event to frontend
+                            action_data = json.loads(result_str)
+                            action_data["tool"] = tc["name"]
+                            loop.call_soon_threadsafe(queue.put_nowait, ("action", json.dumps(action_data)))
+
+                            tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+
+                        # Second LLM call with tool results (no tools — prevent loops)
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": content_text or None,
+                            "tool_calls": [
+                                {
+                                    "id": tool_calls_by_index[i]["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_calls_by_index[i]["name"],
+                                        "arguments": tool_calls_by_index[i]["arguments"],
+                                    },
+                                }
+                                for i in sorted(tool_calls_by_index.keys())
+                            ],
+                        }
+
+                        stream2 = client.chat.completions.create(
+                            model=chat_model,
+                            messages=messages + [assistant_msg] + tool_results,
+                            stream=True,
+                            temperature=0.7,
+                            max_tokens=2000,
+                        )
+                        for chunk in stream2:
                             delta = chunk.choices[0].delta
                             if delta.content:
                                 loop.call_soon_threadsafe(queue.put_nowait, ("token", delta.content))
+
                         loop.call_soon_threadsafe(queue.put_nowait, ("done", ""))
                     except Exception as e:
                         loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)[:200]))
@@ -374,10 +541,12 @@ def start_graph_server(host: str, port: int) -> None:
 
                 while True:
                     event_type, data = await queue.get()
-                    # JSON-encode token data to preserve newlines in SSE transport
-                    encoded = json.dumps(data) if event_type == "token" else data
-                    yield {"event": event_type, "data": encoded}
-                    if event_type in ("done", "error"):
+                    if event_type == "token":
+                        yield {"event": "token", "data": json.dumps(data)}
+                    elif event_type == "action":
+                        yield {"event": "action", "data": data}
+                    elif event_type in ("done", "error"):
+                        yield {"event": event_type, "data": data}
                         break
 
             return EventSourceResponse(event_generator())

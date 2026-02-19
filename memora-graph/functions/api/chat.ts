@@ -1,6 +1,7 @@
 /**
- * POST /api/chat - Chat about memories using LLM with RAG
+ * POST /api/chat - Chat about memories using LLM with RAG + tool calling
  * Uses semantic search (embeddings) + keyword search for memory retrieval.
+ * Supports create/update/delete memories via OpenAI-style tool calling.
  * Requires OPENROUTER_API_KEY secret and optionally CHAT_MODEL env var.
  * Supports ?db=memora or ?db=ob1 parameter to select database.
  */
@@ -29,7 +30,13 @@ interface MemoryRow {
 
 interface ChatMessage {
   role: string;
-  content: string;
+  content: string | null;
+  tool_calls?: Array<{
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+  }>;
+  tool_call_id?: string;
 }
 
 interface ChatRequest {
@@ -41,6 +48,7 @@ interface MemoryReference {
   id: number;
   score: number;
   preview: string;
+  method?: string;
 }
 
 function parseJson<T>(str: string | null, defaultValue: T): T {
@@ -52,9 +60,179 @@ function parseJson<T>(str: string | null, defaultValue: T): T {
   }
 }
 
-/**
- * Get embedding vector for a query via OpenRouter/OpenAI embeddings API.
- */
+// ── Tool definitions ──────────────────────────────────────────────────
+
+const CHAT_TOOLS = [
+  {
+    type: "function" as const,
+    function: {
+      name: "create_memory",
+      description:
+        "Create a new memory in the knowledge base. Use when the user asks to save, create, add, or remember something.",
+      parameters: {
+        type: "object",
+        properties: {
+          content: {
+            type: "string",
+            description: "The full text content of the memory.",
+          },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional tags to categorize the memory.",
+          },
+        },
+        required: ["content"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "update_memory",
+      description:
+        "Update an existing memory by ID. Use when the user asks to modify, edit, or change a specific memory.",
+      parameters: {
+        type: "object",
+        properties: {
+          memory_id: {
+            type: "integer",
+            description: "The ID of the memory to update.",
+          },
+          content: {
+            type: "string",
+            description: "New full text content. Replaces existing content.",
+          },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "New tags. Replaces all existing tags.",
+          },
+        },
+        required: ["memory_id"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "delete_memory",
+      description:
+        "Delete a memory by ID. Use when the user asks to remove or delete a specific memory.",
+      parameters: {
+        type: "object",
+        properties: {
+          memory_id: {
+            type: "integer",
+            description: "The ID of the memory to delete.",
+          },
+        },
+        required: ["memory_id"],
+      },
+    },
+  },
+];
+
+// ── Tool execution via D1 ─────────────────────────────────────────────
+
+async function executeToolCall(
+  db: D1Database,
+  toolName: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  try {
+    if (toolName === "create_memory") {
+      const content = String(args.content || "");
+      const tags = Array.isArray(args.tags) ? args.tags : [];
+      const result = await db
+        .prepare(
+          "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, '{}', ?, datetime('now'))"
+        )
+        .bind(content, JSON.stringify(tags))
+        .run();
+      const newId = result.meta?.last_row_id;
+      return JSON.stringify({
+        success: true,
+        action: "created",
+        memory_id: newId,
+        preview: content.slice(0, 100),
+      });
+    }
+
+    if (toolName === "update_memory") {
+      const mid = Number(args.memory_id);
+      if (!mid || isNaN(mid)) {
+        return JSON.stringify({ success: false, error: "Invalid memory_id." });
+      }
+      // Fetch existing
+      const existing = await db
+        .prepare("SELECT id, content, tags FROM memories WHERE id = ?")
+        .bind(mid)
+        .first<MemoryRow>();
+      if (!existing) {
+        return JSON.stringify({
+          success: false,
+          error: `Memory #${mid} not found.`,
+        });
+      }
+      const newContent =
+        args.content !== undefined ? String(args.content) : existing.content;
+      const newTags =
+        args.tags !== undefined
+          ? JSON.stringify(args.tags)
+          : existing.tags;
+      await db
+        .prepare(
+          "UPDATE memories SET content = ?, tags = ?, updated_at = datetime('now') WHERE id = ?"
+        )
+        .bind(newContent, newTags, mid)
+        .run();
+      return JSON.stringify({
+        success: true,
+        action: "updated",
+        memory_id: mid,
+        preview: newContent.slice(0, 100),
+      });
+    }
+
+    if (toolName === "delete_memory") {
+      const mid = Number(args.memory_id);
+      if (!mid || isNaN(mid)) {
+        return JSON.stringify({ success: false, error: "Invalid memory_id." });
+      }
+      const existing = await db
+        .prepare("SELECT id, content FROM memories WHERE id = ?")
+        .bind(mid)
+        .first<{ id: number; content: string }>();
+      if (!existing) {
+        return JSON.stringify({
+          success: false,
+          error: `Memory #${mid} not found.`,
+        });
+      }
+      // Delete related data first, then the memory
+      await db.batch([
+        db.prepare("DELETE FROM memories_embeddings WHERE memory_id = ?").bind(mid),
+        db.prepare("DELETE FROM memories_crossrefs WHERE memory_id = ?").bind(mid),
+        db.prepare("DELETE FROM memories WHERE id = ?").bind(mid),
+      ]);
+      return JSON.stringify({
+        success: true,
+        action: "deleted",
+        memory_id: mid,
+        preview: existing.content.slice(0, 100),
+      });
+    }
+
+    return JSON.stringify({ success: false, error: `Unknown tool: ${toolName}` });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return JSON.stringify({ success: false, error: msg.slice(0, 200) });
+  }
+}
+
+// ── Embedding / search helpers ────────────────────────────────────────
+
 async function getQueryEmbedding(
   query: string,
   apiKey: string,
@@ -82,12 +260,11 @@ async function getQueryEmbedding(
   }
 }
 
-/**
- * Compute cosine similarity between two vectors.
- */
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length || a.length === 0) return 0;
-  let dot = 0, normA = 0, normB = 0;
+  let dot = 0,
+    normA = 0,
+    normB = 0;
   for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
     normA += a[i] * a[i];
@@ -97,15 +274,11 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
-/**
- * Semantic search: embed the query, then compare against stored embeddings.
- */
 async function semanticSearch(
   db: D1Database,
   queryEmbedding: number[],
   topK: number
 ): Promise<Array<{ memory: MemoryRow; score: number }>> {
-  // Fetch all embeddings and memory content in one query
   const result = await db
     .prepare(
       `SELECT m.id, m.content, m.tags, m.created_at, e.embedding
@@ -116,52 +289,42 @@ async function semanticSearch(
 
   if (!result.results || result.results.length === 0) return [];
 
-  // Compute recency boost: newer memories get a small score bonus
   const now = Date.now();
   function recencyBoost(createdAt: string | undefined): number {
     if (!createdAt) return 0;
     const age = now - new Date(createdAt).getTime();
     const days = age / (1000 * 60 * 60 * 24);
-    // Boost up to 0.05 for very recent (today), decaying over 90 days
     return Math.max(0, 0.05 * (1 - days / 90));
   }
 
-  // Score each memory by cosine similarity + recency
   const scored: Array<{ memory: MemoryRow; score: number }> = [];
   for (const row of result.results) {
-    // Stored format: array of [string_index, float_value] pairs
     const pairs = parseJson<Array<[string, number]>>(row.embedding, []);
     if (pairs.length === 0) continue;
-
-    // Convert to dense array
     const dense = new Array(queryEmbedding.length).fill(0);
     for (const [k, v] of pairs) {
       const idx = parseInt(k, 10);
-      if (idx < dense.length) {
-        dense[idx] = v;
-      }
+      if (idx < dense.length) dense[idx] = v;
     }
-
     const similarity = cosineSimilarity(queryEmbedding, dense);
     const boost = recencyBoost(row.created_at);
-    const score = similarity + boost;
-
     if (similarity > 0.1) {
       scored.push({
-        memory: { id: row.id, content: row.content, tags: row.tags, created_at: row.created_at },
-        score,
+        memory: {
+          id: row.id,
+          content: row.content,
+          tags: row.tags,
+          created_at: row.created_at,
+        },
+        score: similarity + boost,
       });
     }
   }
 
-  // Sort by score descending, return top K
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, topK);
 }
 
-/**
- * Keyword fallback search using LIKE matching on content and tags.
- */
 async function keywordSearch(
   db: D1Database,
   query: string,
@@ -170,8 +333,8 @@ async function keywordSearch(
   const keywords = query
     .toLowerCase()
     .split(/\s+/)
-    .map(w => w.replace(/[^a-z0-9-]/g, ""))
-    .filter(w => w.length >= 3);
+    .map((w) => w.replace(/[^a-z0-9-]/g, ""))
+    .filter((w) => w.length >= 3);
 
   if (keywords.length === 0) {
     const result = await db
@@ -180,7 +343,7 @@ async function keywordSearch(
       )
       .bind(topK)
       .all<MemoryRow>();
-    return (result.results || []).map(m => ({ memory: m, score: 0.1 }));
+    return (result.results || []).map((m) => ({ memory: m, score: 0.1 }));
   }
 
   const conditions = keywords.map(
@@ -204,35 +367,29 @@ async function keywordSearch(
     .bind(...params, topK)
     .all<MemoryRow>();
 
-  return (result.results || []).map(m => ({
+  return (result.results || []).map((m) => ({
     memory: { id: m.id, content: m.content, tags: m.tags },
     score: 0.3,
   }));
 }
 
-/**
- * Combined search: try semantic first, fall back to keyword, then recent.
- * Returns results with a `method` field indicating which search was used.
- */
 async function searchMemories(
   db: D1Database,
   query: string,
   apiKey: string,
   embeddingModel: string,
   topK: number = 8
-): Promise<{ results: Array<{ memory: MemoryRow; score: number }>; method: string }> {
-  // Try semantic search first
+): Promise<{
+  results: Array<{ memory: MemoryRow; score: number }>;
+  method: string;
+}> {
   const queryEmbedding = await getQueryEmbedding(query, apiKey, embeddingModel);
   if (queryEmbedding) {
     const results = await semanticSearch(db, queryEmbedding, topK);
     if (results.length > 0) return { results, method: "semantic" };
   }
-
-  // Try keyword search
   const kwResults = await keywordSearch(db, query, topK);
   if (kwResults.length > 0) return { results: kwResults, method: "keyword" };
-
-  // Final fallback: return recent memories
   const result = await db
     .prepare(
       "SELECT id, content, tags FROM memories ORDER BY created_at DESC LIMIT ?"
@@ -240,10 +397,110 @@ async function searchMemories(
     .bind(topK)
     .all<MemoryRow>();
   return {
-    results: (result.results || []).map(m => ({ memory: m, score: 0.1 })),
+    results: (result.results || []).map((m) => ({ memory: m, score: 0.1 })),
     method: "recent",
   };
 }
+
+// ── LLM call helper ───────────────────────────────────────────────────
+
+interface LLMCallOptions {
+  apiKey: string;
+  model: string;
+  messages: ChatMessage[];
+  origin: string;
+  tools?: typeof CHAT_TOOLS;
+}
+
+async function callLLM(opts: LLMCallOptions): Promise<Response> {
+  const body: Record<string, unknown> = {
+    model: opts.model,
+    messages: opts.messages,
+    stream: true,
+    temperature: 0.7,
+    max_tokens: 2000,
+  };
+  if (opts.tools) {
+    body.tools = opts.tools;
+  }
+  return fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${opts.apiKey}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": opts.origin,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+// ── Parse one SSE stream, accumulating content + tool_call deltas ─────
+
+interface StreamResult {
+  content: string;
+  toolCalls: Record<
+    number,
+    { id: string; name: string; arguments: string }
+  >;
+}
+
+async function consumeStream(
+  response: Response,
+  onToken: (text: string) => Promise<void>
+): Promise<StreamResult> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const result: StreamResult = { content: "", toolCalls: {} };
+
+  const reader = response.body!.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (data === "[DONE]") continue;
+
+      try {
+        const chunk = JSON.parse(data);
+        const delta = chunk.choices?.[0]?.delta;
+        if (!delta) continue;
+
+        // Content tokens
+        if (delta.content) {
+          result.content += delta.content;
+          await onToken(delta.content);
+        }
+
+        // Tool call deltas
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!result.toolCalls[idx]) {
+              result.toolCalls[idx] = { id: "", name: "", arguments: "" };
+            }
+            const entry = result.toolCalls[idx];
+            if (tc.id) entry.id = tc.id;
+            if (tc.function?.name) entry.name = tc.function.name;
+            if (tc.function?.arguments)
+              entry.arguments += tc.function.arguments;
+          }
+        }
+      } catch {
+        // Skip malformed chunks
+      }
+    }
+  }
+
+  return result;
+}
+
+// ── Main handler ──────────────────────────────────────────────────────
 
 export const onRequestPost: PagesFunction<Env> = async ({
   env,
@@ -279,19 +536,16 @@ export const onRequestPost: PagesFunction<Env> = async ({
 
   const history = body.history || [];
   const model = env.CHAT_MODEL || "deepseek/deepseek-chat";
-  const embeddingModel = env.EMBEDDING_MODEL || "openai/text-embedding-3-small";
+  const embeddingModel =
+    env.EMBEDDING_MODEL || "openai/text-embedding-3-small";
+  const origin = url.origin;
 
-  // Search for relevant memories using semantic + keyword search
-  const { results: searchResults, method: searchMethod } = await searchMemories(
-    db,
-    message,
-    apiKey,
-    embeddingModel,
-    8
-  );
+  // Search for relevant memories
+  const { results: searchResults, method: searchMethod } =
+    await searchMemories(db, message, apiKey, embeddingModel, 8);
 
   // Build references and context
-  const references: (MemoryReference & { method?: string })[] = [];
+  const references: MemoryReference[] = [];
   const contextParts: string[] = [];
 
   for (const r of searchResults) {
@@ -303,7 +557,9 @@ export const onRequestPost: PagesFunction<Env> = async ({
       preview: mem.content.slice(0, 100).replace(/\n/g, " "),
     });
     const tagsStr = tags.join(", ");
-    const dateStr = mem.created_at ? ` [${mem.created_at.split(" ")[0]}]` : "";
+    const dateStr = mem.created_at
+      ? ` [${mem.created_at.split(" ")[0]}]`
+      : "";
     const contentTruncated = mem.content.slice(0, 1500);
     contextParts.push(
       `Memory #${mem.id} (tags: ${tagsStr})${dateStr}:\n${contentTruncated}`
@@ -318,9 +574,21 @@ export const onRequestPost: PagesFunction<Env> = async ({
   const systemMsg: ChatMessage = {
     role: "system",
     content: [
-      "You are a helpful assistant answering questions about the user's personal knowledge base.",
+      "You are a helpful assistant for the user's personal knowledge base (Memora).",
       "Use the following memories as context. When referencing a memory, cite it as [Memory #<id>].",
       "If the memories don't contain relevant information, say so honestly.",
+      "",
+      "## Tool Use — IMPORTANT",
+      "",
+      "You have tools to create, update, and delete memories. You MUST call the appropriate tool when the user asks to:",
+      "- Create/save/add/remember something → call create_memory",
+      "- Update/edit/modify a memory → call update_memory",
+      "- Delete/remove a memory → call delete_memory",
+      "",
+      "ALWAYS call the tool directly. Do NOT ask for confirmation, do NOT say you can't find the memory, do NOT suggest content without calling the tool.",
+      "The memory database has many more entries than what's shown in context below — if the user references a memory ID, trust them and call the tool.",
+      "When creating a memory, write substantive, well-structured content.",
+      "When updating, apply the user's requested changes to the existing content.",
       "",
       "## Relevant Memories",
       "",
@@ -328,88 +596,126 @@ export const onRequestPost: PagesFunction<Env> = async ({
     ].join("\n"),
   };
 
-  // Build messages: system + last 20 history + current
   const trimmedHistory = history.slice(-20);
-  const messages = [
+  const messages: ChatMessage[] = [
     systemMsg,
     ...trimmedHistory,
     { role: "user", content: message },
   ];
 
-  // Stream response from OpenRouter
-  const llmResponse = await fetch(
-    "https://openrouter.ai/api/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": url.origin,
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        stream: true,
-        temperature: 0.7,
-        max_tokens: 2000,
-      }),
-    }
-  );
+  // ── Streaming response with tool calling ──────────────────────────
 
-  if (!llmResponse.ok || !llmResponse.body) {
-    const errText = await llmResponse.text().catch(() => "Unknown error");
-    return Response.json(
-      { error: "llm_error", message: errText.slice(0, 200) },
-      { status: 502 }
-    );
-  }
-
-  // Transform the OpenAI-format SSE stream into our chat SSE format
   const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
 
   const writeSSE = async (event: string, data: string) => {
-    // JSON-encode token data to preserve newlines in SSE transport
     const encoded = event === "token" ? JSON.stringify(data) : data;
-    await writer.write(encoder.encode(`event: ${event}\ndata: ${encoded}\n\n`));
+    await writer.write(
+      encoder.encode(`event: ${event}\ndata: ${encoded}\n\n`)
+    );
   };
 
-  // Process the stream in the background
   const processStream = async () => {
     try {
-      // Emit references with search method info
+      // Emit references
       if (references.length > 0) references[0].method = searchMethod;
       await writeSSE("references", JSON.stringify(references));
 
-      const reader = llmResponse.body!.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      // First LLM call — with tools
+      const llmResponse = await callLLM({
+        apiKey,
+        model,
+        messages,
+        origin,
+        tools: CHAT_TOOLS,
+      });
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6).trim();
-          if (data === "[DONE]") continue;
-
-          try {
-            const chunk = JSON.parse(data);
-            const content = chunk.choices?.[0]?.delta?.content;
-            if (content) {
-              await writeSSE("token", content);
-            }
-          } catch {
-            // Skip malformed chunks
-          }
-        }
+      if (!llmResponse.ok || !llmResponse.body) {
+        const errText = await llmResponse
+          .text()
+          .catch(() => "Unknown error");
+        await writeSSE("error", errText.slice(0, 200));
+        return;
       }
+
+      // Consume stream, forwarding content tokens
+      const streamResult = await consumeStream(
+        llmResponse,
+        async (token) => {
+          await writeSSE("token", token);
+        }
+      );
+
+      // No tool calls → done
+      const tcIndices = Object.keys(streamResult.toolCalls).map(Number);
+      if (tcIndices.length === 0) {
+        await writeSSE("done", "");
+        return;
+      }
+
+      // Execute tool calls
+      const toolResults: ChatMessage[] = [];
+      for (const idx of tcIndices.sort((a, b) => a - b)) {
+        const tc = streamResult.toolCalls[idx];
+        let args: Record<string, unknown> = {};
+        try {
+          args = JSON.parse(tc.arguments);
+        } catch {
+          /* empty args */
+        }
+
+        const resultStr = await executeToolCall(db, tc.name, args);
+
+        // Emit action event to frontend
+        const actionData = JSON.parse(resultStr);
+        actionData.tool = tc.name;
+        await writeSSE("action", JSON.stringify(actionData));
+
+        toolResults.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: resultStr,
+        });
+      }
+
+      // Build assistant message with tool_calls for context
+      const assistantMsg: ChatMessage = {
+        role: "assistant",
+        content: streamResult.content || null,
+        tool_calls: tcIndices
+          .sort((a, b) => a - b)
+          .map((i) => ({
+            id: streamResult.toolCalls[i].id,
+            type: "function",
+            function: {
+              name: streamResult.toolCalls[i].name,
+              arguments: streamResult.toolCalls[i].arguments,
+            },
+          })),
+      };
+
+      // Second LLM call — with tool results, no tools (prevent loops)
+      const llmResponse2 = await callLLM({
+        apiKey,
+        model,
+        messages: [...messages, assistantMsg, ...toolResults],
+        origin,
+        // no tools on second call
+      });
+
+      if (!llmResponse2.ok || !llmResponse2.body) {
+        const errText = await llmResponse2
+          .text()
+          .catch(() => "Unknown error");
+        await writeSSE("error", errText.slice(0, 200));
+        return;
+      }
+
+      // Stream second response content
+      await consumeStream(llmResponse2, async (token) => {
+        await writeSSE("token", token);
+      });
 
       await writeSSE("done", "");
     } catch (e: unknown) {
@@ -420,7 +726,7 @@ export const onRequestPost: PagesFunction<Env> = async ({
     }
   };
 
-  // Start processing without awaiting (runs concurrently with response streaming)
+  // Start processing (runs concurrently with response streaming)
   processStream();
 
   return new Response(readable, {

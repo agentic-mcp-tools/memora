@@ -417,6 +417,11 @@ div.vis-tooltip {
 .chat-msg.error { background: #f8514922; border: 1px solid #f8514944; color: #f85149; }
 .chat-msg.welcome { background: none; border: none; color: #8b949e; text-align: center; padding: 20px; max-width: 100%; }
 
+.chat-action { margin: 8px 0; padding: 8px 12px; border-radius: 6px; font-size: 12px; line-height: 1.5; background: #23863622; border: 1px solid #23863644; color: #3fb950; }
+.chat-action.error { background: #da363622; border-color: #da363644; color: #f85149; }
+.chat-action .action-preview { color: #8b949e; font-size: 11px; display: block; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 400px; }
+.chat-action .action-mem-link { color: #58a6ff; text-decoration: none; cursor: pointer; }
+.chat-action .action-mem-link:hover { text-decoration: underline; color: #79b8ff; }
 .chat-refs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; padding-top: 8px; border-top: 1px solid #30363d; }
 .chat-ref { background: #21262d; border: 1px solid #30363d; color: #58a6ff; padding: 2px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; }
 .chat-ref:hover { background: #30363d; color: #79b8ff; }
@@ -2223,7 +2228,35 @@ div.vis-tooltip {
                             var data = line.slice(6);
                             if (eventType === 'references') {
                                 try { references = JSON.parse(data); } catch(e) {}
+                            } else if (eventType === 'action') {
+                                var typing = document.getElementById('chat-typing');
+                                if (typing) typing.remove();
+                                try {
+                                    var action = JSON.parse(data);
+                                    var actionDiv = document.createElement('div');
+                                    actionDiv.className = 'chat-action' + (action.success ? '' : ' error');
+                                    if (action.success) {
+                                        var verb = action.action === 'created' ? 'Created' : action.action === 'updated' ? 'Updated' : 'Deleted';
+                                        var memLink = action.action !== 'deleted'
+                                            ? '<a class="action-mem-link" href="#" onclick="showMemoryDetails(' + action.memory_id + '); return false;">#' + action.memory_id + '</a>'
+                                            : '#' + action.memory_id;
+                                        actionDiv.innerHTML = '<strong>' + verb + ' Memory ' + memLink + '</strong>';
+                                        if (action.preview) actionDiv.innerHTML += '<span class="action-preview">' + escapeHtmlText(action.preview) + '</span>';
+                                    } else {
+                                        actionDiv.innerHTML = '<strong>Action failed:</strong> ' + escapeHtmlText(action.error || 'Unknown error');
+                                    }
+                                    assistantDiv.parentNode.insertBefore(actionDiv, assistantDiv);
+                                    msgs.scrollTop = msgs.scrollHeight;
+                                    if (action.success) {
+                                        reloadGraphData();
+                                        cachedTimelineMemories = null;
+                                        timelineOffset = 0;
+                                        loadTimelinePage();
+                                    }
+                                } catch(e) { console.error('action parse error', e); }
                             } else if (eventType === 'token') {
+                                var typing = document.getElementById('chat-typing');
+                                if (typing) typing.remove();
                                 try { fullText += JSON.parse(data); } catch(e) { fullText += data; }
                                 contentDiv.innerHTML = linkifyMemoryRefs(renderMarkdown(fullText));
                                 msgs.scrollTop = msgs.scrollHeight;
