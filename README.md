@@ -4,7 +4,7 @@
 
 <p align="center">
 <b>Give your AI agents persistent memory</b><br>
-A lightweight MCP server for semantic memory storage, knowledge graphs, and cross-session context.
+A lightweight MCP server for semantic memory storage, knowledge graphs, conversational recall, and cross-session context.
 </p>
 
 <p align="center">
