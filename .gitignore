@@ -16,3 +16,7 @@ lib/
 # uv lock file
 uv.lock
 data/
+
+# Build artifacts
+dist/
+.wrangler/
