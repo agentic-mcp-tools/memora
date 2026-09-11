@@ -626,6 +626,24 @@ _REBUILD_LEASE_SECONDS = 300
 _REBUILD_REPAIR_CHUNK_SIZE = 20
 _EMBEDDING_REQUEST_TIMEOUT_SECONDS = 90.0
 _EMBEDDING_MAX_RETRIES = 1
+_DEFAULT_REBUILD_CHUNK_SIZE = 32
+
+
+def _resolve_rebuild_chunk_size() -> int:
+    """Row count per rebuild_all_embeddings() batch (embed call + write).
+
+    Resolved at call time (not import time) so tests can monkeypatch the env
+    var; an unset/invalid value falls back to the default rather than raising.
+    """
+    raw = os.getenv("MEMORA_REBUILD_CHUNK_SIZE")
+    if raw is None:
+        return _DEFAULT_REBUILD_CHUNK_SIZE
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_REBUILD_CHUNK_SIZE
+    return value if value >= 1 else _DEFAULT_REBUILD_CHUNK_SIZE
+
 
 # A semantic search opens a new connection for each MCP call, so the cache key
 # must identify the underlying store rather than the Python connection object.
@@ -916,13 +934,16 @@ def _previous_embedding_rep(conn: sqlite3.Connection, memory_id: int) -> Optiona
     return _vector_representation(json_to_embedding(raw))
 
 
-def upsert_embedding(
-    conn: sqlite3.Connection,
+def _embedding_upsert_sql_and_params(
     memory_id: int,
     vector: Dict[str, float],
-    *,
     lease_owner: Optional[str] = None,
-) -> None:
+) -> Tuple[str, tuple[Any, ...]]:
+    """Build the (sql, params) pair for one embedding upsert.
+
+    Shared by upsert_embedding() (single row) and upsert_embeddings_batch()
+    (executemany) so the two paths cannot drift apart.
+    """
     import uuid
     emb_json = embedding_to_json(vector)
     rep = _vector_representation(vector)
@@ -960,9 +981,46 @@ def upsert_embedding(
                 writer_token=excluded.writer_token
         """
         params += (_REBUILD_LEASE_KEY, f"{lease_owner}|%")
+    return sql, params
+
+
+def upsert_embedding(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    vector: Dict[str, float],
+    *,
+    lease_owner: Optional[str] = None,
+) -> None:
+    sql, params = _embedding_upsert_sql_and_params(memory_id, vector, lease_owner)
     changed = conn.execute(sql, params).rowcount
     if lease_owner is not None and not changed:
         raise EmbeddingIntegrityFault("integrity_rebuild_lease_lost", [])
+
+
+def upsert_embeddings_batch(
+    conn: sqlite3.Connection,
+    items: List[Tuple[int, Dict[str, float]]],
+    *,
+    lease_owner: Optional[str] = None,
+) -> None:
+    """Upsert many (memory_id, vector) pairs. The caller commits once for the
+    whole batch instead of once per row.
+
+    Deliberately loops upsert_embedding() (one execute() per row) rather than
+    a single conn.executemany() call. SQLite's (and D1's, which is SQLite
+    under the hood) changes() count for an INSERT ... ON CONFLICT DO UPDATE
+    is 1 when the plain-INSERT branch is taken but 2 when the UPDATE branch
+    fires on an existing row. executemany() only exposes one aggregate total
+    across the whole call, so an exact "changed == len(items)" lease check
+    against that aggregate is unreliable the moment a chunk mixes inserts and
+    updates — which every rebuild of an already-embedded store does, i.e.
+    virtually always. Checking each row's own rowcount individually, exactly
+    like the single-row path always has, sidesteps the ambiguity: 0 always
+    means blocked regardless of whether an allowed write would have been 1
+    or 2, so the existing per-row lease fence stays exact.
+    """
+    for memory_id, vector in items:
+        upsert_embedding(conn, memory_id, vector, lease_owner=lease_owner)
 
 
 def delete_embedding(conn: sqlite3.Connection, memory_id: int) -> None:
@@ -1424,18 +1482,40 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     repaired_ids = [int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0]) for row in repaired_rows]
     updated = 0
     seen_reps: Set[str] = set()
-    for row in rows:
+    chunk_size = _resolve_rebuild_chunk_size()
+    total = len(rows)
+    for start in range(0, total, chunk_size):
+        chunk = rows[start : start + chunk_size]
+        # Fence BEFORE the (potentially slow) batch embed call, same as the
+        # old per-row fence before compute_embedding().
         _assert_rebuild_lease_owner(conn, lease_owner)
-        memory_id = row["id"]
-        metadata = json.loads(row["metadata"]) if row["metadata"] else None
-        tags = json.loads(row["tags"]) if row["tags"] else []
-        vector = compute_embedding(row["content"], metadata, tags, embedding_model)
+        entries = [
+            {
+                "content": row["content"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+                "tags": json.loads(row["tags"]) if row["tags"] else [],
+            }
+            for row in chunk
+        ]
+        # compute_embeddings_batch() already enforces strict-mode semantics
+        # for every backend (raises EmbeddingStrictError, never substitutes
+        # TF-IDF, under MEMORA_EMBEDDING_STRICT=1) — same contract this loop
+        # relied on from compute_embedding() per row.
+        vectors = compute_embeddings_batch(entries, embedding_model)
+        # Fence again BEFORE writing, same as the old per-row fence before
+        # upsert_embedding().
         _assert_rebuild_lease_owner(conn, lease_owner)
-        rep = _vector_representation(vector)
-        seen_reps.add(rep)
-        upsert_embedding(conn, memory_id, vector, lease_owner=lease_owner)
+        items: List[Tuple[int, Dict[str, float]]] = []
+        for row, vector in zip(chunk, vectors):
+            seen_reps.add(_vector_representation(vector))
+            items.append((row["id"], vector))
+        upsert_embeddings_batch(conn, items, lease_owner=lease_owner)
         conn.commit()
-        updated += 1
+        updated += len(chunk)
+        _logger.info(
+            "rebuild_all_embeddings: %d/%d done (chunk_size=%d)",
+            updated, total, chunk_size,
+        )
 
     if updated == 0:
         _assert_rebuild_lease_owner(conn, lease_owner)

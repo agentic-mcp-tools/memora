@@ -897,6 +897,152 @@ def test_rebuild_migrates_existing_empty_embedding_marker(absorb_backend):
         assert emb._meta_get(conn, "embedding_change_epoch") == epoch_before
 
 
+class _CommitCountingConnection(sqlite3.Connection):
+    """sqlite3.Connection subclass that counts commit() calls.
+
+    sqlite3.Connection instances don't allow arbitrary attribute assignment
+    (commit is a read-only C-level attribute), so counting via a Python
+    subclass passed as connect()'s factory is the mechanism that works.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.commit_count = 0
+
+    def commit(self):
+        self.commit_count += 1
+        return super().commit()
+
+
+def _make_chunk_test_conn(path, n_rows):
+    from memora.schema import ensure_schema
+
+    conn = sqlite3.connect(path, factory=_CommitCountingConnection)
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    for i in range(n_rows):
+        conn.execute("INSERT INTO memories(content, tags) VALUES (?, '[]')", (f"row {i}",))
+    conn.commit()
+    conn.commit_count = 0  # only count commits made during the rebuild itself
+    return conn
+
+
+def test_rebuild_all_embeddings_batches_by_chunk_size(tmp_path, monkeypatch):
+    """rebuild_all_embeddings embeds and writes in chunks, not one row at a time."""
+    conn = _make_chunk_test_conn(tmp_path / "chunk-rebuild.db", 5)
+
+    batch_call_sizes: List[int] = []
+
+    def fake_batch(entries, embedding_model):
+        batch_call_sizes.append(len(entries))
+        return [{"0": 0.1, "1": 0.2} for _ in entries]
+
+    monkeypatch.setattr(emb, "compute_embeddings_batch", fake_batch)
+
+    write_call_sizes: List[int] = []
+    real_write = emb.upsert_embeddings_batch
+
+    def spy_write(conn_, items, **kwargs):
+        write_call_sizes.append(len(items))
+        return real_write(conn_, items, **kwargs)
+
+    monkeypatch.setattr(emb, "upsert_embeddings_batch", spy_write)
+
+    monkeypatch.setenv("MEMORA_REBUILD_CHUNK_SIZE", "2")
+    updated = emb.rebuild_all_embeddings(conn, "tfidf")
+
+    assert updated == 5
+    # 5 rows at chunk size 2 -> three chunks of 2, 2, 1 on both the embed
+    # side and the write side (one compute_embeddings_batch call and one
+    # upsert_embeddings_batch call per chunk, not per row).
+    assert batch_call_sizes == [2, 2, 1]
+    assert write_call_sizes == [2, 2, 1]
+    # One commit per chunk's write, distinct from the per-row commit this
+    # replaced (which would have been 5, one per row, for the writes alone).
+    assert conn.commit_count >= len(write_call_sizes)
+    conn.close()
+
+
+def test_rebuild_all_embeddings_uses_fewer_commits_at_larger_chunk_size(tmp_path, monkeypatch):
+    """Commit count scales with chunk count, not row count."""
+
+    def fake_batch(entries, embedding_model):
+        return [{"0": 0.1, "1": 0.2} for _ in entries]
+
+    monkeypatch.setattr(emb, "compute_embeddings_batch", fake_batch)
+
+    conn_small_chunks = _make_chunk_test_conn(tmp_path / "small-chunks.db", 6)
+    monkeypatch.setenv("MEMORA_REBUILD_CHUNK_SIZE", "1")
+    assert emb.rebuild_all_embeddings(conn_small_chunks, "tfidf") == 6
+    commits_small = conn_small_chunks.commit_count
+    conn_small_chunks.close()
+
+    conn_large_chunk = _make_chunk_test_conn(tmp_path / "large-chunk.db", 6)
+    monkeypatch.setenv("MEMORA_REBUILD_CHUNK_SIZE", "6")
+    assert emb.rebuild_all_embeddings(conn_large_chunk, "tfidf") == 6
+    commits_large = conn_large_chunk.commit_count
+    conn_large_chunk.close()
+
+    assert commits_large < commits_small
+
+
+def test_rebuild_all_embeddings_chunk_failure_is_strict_not_tfidf_fallback(tmp_path, monkeypatch):
+    """A failed chunk under MEMORA_EMBEDDING_STRICT must raise, never fall back
+    to TF-IDF and never leave partial vectors behind."""
+    from memora.schema import ensure_schema
+
+    conn = sqlite3.connect(tmp_path / "chunk-strict.db")
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    for i in range(3):
+        conn.execute("INSERT INTO memories(content, tags) VALUES (?, '[]')", (f"row {i}",))
+    conn.commit()
+
+    def failing_batch(entries, embedding_model):
+        raise emb.EmbeddingStrictError("simulated provider outage")
+
+    monkeypatch.setattr(emb, "compute_embeddings_batch", failing_batch)
+    monkeypatch.setenv("MEMORA_REBUILD_CHUNK_SIZE", "10")
+
+    with pytest.raises(emb.EmbeddingStrictError, match="simulated provider outage"):
+        emb.rebuild_all_embeddings(conn, "openai")
+
+    count = conn.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0]
+    assert count == 0
+    conn.close()
+
+
+def test_rebuild_all_embeddings_succeeds_when_every_row_already_has_an_embedding(tmp_path, monkeypatch):
+    """Regression: re-rebuilding an already-embedded store must not raise.
+
+    Every row here already has a stored embedding before the rebuild, so
+    every chunk write goes through the ON CONFLICT DO UPDATE branch, which
+    SQLite/D1 count as 2 changes per row rather than 1. An aggregate
+    changed == len(items) check (as conn.executemany()'s single return value
+    would force) misfires here; upsert_embeddings_batch must not use it.
+    """
+    conn = _make_chunk_test_conn(tmp_path / "already-embedded.db", 5)
+    for row in conn.execute("SELECT id FROM memories").fetchall():
+        emb.upsert_embedding(conn, row["id"], {"0": 0.9, "1": 0.1})
+    conn.commit()
+
+    def fake_batch(entries, embedding_model):
+        # Every call returns a *different* vector than what's stored, so a
+        # successful rebuild is verifiable, not just a no-op re-write.
+        return [{"0": 0.2, "1": 0.8} for _ in entries]
+
+    monkeypatch.setattr(emb, "compute_embeddings_batch", fake_batch)
+    monkeypatch.setenv("MEMORA_REBUILD_CHUNK_SIZE", "2")
+
+    assert emb.rebuild_all_embeddings(conn, "tfidf") == 5
+
+    rows = conn.execute("SELECT embedding FROM memories_embeddings").fetchall()
+    assert len(rows) == 5
+    for row in rows:
+        assert emb.json_to_embedding(row["embedding"]) == {"0": 0.2, "1": 0.8}
+    conn.close()
+
+
 def test_repair_upsert_aborts_on_stolen_lease_without_overwriting_winner(tmp_path):
     """D1-style repair statements are individually lease-fenced."""
     from memora.schema import ensure_schema
